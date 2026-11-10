@@ -1,0 +1,87 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { toConversationResponse } from '../conversations/conversation.response';
+import type {
+  ConversationSummary,
+  NewChannel,
+} from '../conversations/conversations.service';
+import { ConversationsService } from '../conversations/conversations.service';
+import { PeopleService } from '../people/people.service';
+import { PersonSummary, sortedSummaries } from '../people/person-summary';
+import { RealtimePublisher } from '../realtime/realtime.publisher';
+import { PEOPLE_SEARCH_LIMIT } from './membership-values';
+
+export interface AddedMembers {
+  addedIds: string[];
+  memberCount: number;
+}
+
+// Mudanças de participação que viram evento do tempo real (spec da F04, "Tempo real"): grava pelo
+// service de Conversas, que é a transação, e só depois publica conversation.member_added para os
+// Membros. Fica fora do módulo de Conversas porque o tempo real depende dele.
+@Injectable()
+export class MembershipsService {
+  private readonly logger = new Logger(MembershipsService.name);
+
+  constructor(
+    private readonly conversations: ConversationsService,
+    private readonly people: PeopleService,
+    private readonly publisher: RealtimePublisher,
+  ) {}
+
+  // Pessoas para adicionar a uma Conversa de que quem busca é Membro, sem os Membros dela, em ordem
+  // alfabética (spec da F04, "Busca de Pessoas").
+  async searchPeople(
+    personId: string,
+    conversationId: string,
+    q: string,
+  ): Promise<PersonSummary[]> {
+    await this.conversations.getForMember(personId, conversationId);
+    const memberIds = await this.conversations.listMemberIds(conversationId);
+    const people = await this.people.search(
+      q.trim(),
+      memberIds,
+      PEOPLE_SEARCH_LIMIT,
+    );
+    return sortedSummaries(people);
+  }
+
+  // Adiciona Pessoas ao Canal privado e, se alguma entrou agora, avisa os Membros antigos e novos.
+  async addMembers(
+    personId: string,
+    conversationId: string,
+    personIds: string[],
+  ): Promise<AddedMembers> {
+    const { summary, addedIds, memberIds } =
+      await this.conversations.addMembers(personId, conversationId, personIds);
+    if (addedIds.length > 0) {
+      this.publishMemberAdded(summary, memberIds, addedIds);
+    }
+    return { addedIds, memberCount: summary.memberCount };
+  }
+
+  // Cria o Canal e, só quando ele foi criado agora, avisa os Membros: todos eles entraram agora. O
+  // reenvio do mesmo client_id não publica de novo.
+  async createChannel(
+    creatorId: string,
+    newChannel: NewChannel,
+  ): Promise<ConversationSummary> {
+    const { created, memberIds, ...summary } =
+      await this.conversations.createChannel(creatorId, newChannel);
+    if (created) this.publishMemberAdded(summary, memberIds, memberIds);
+    return summary;
+  }
+
+  // Publica sem prender a resposta: a gravação já aconteceu, e a falha vai para o log, como no envio
+  // de Mensagem.
+  private publishMemberAdded(
+    summary: ConversationSummary,
+    memberIds: string[],
+    addedIds: string[],
+  ): void {
+    this.publisher
+      .memberAdded(memberIds, toConversationResponse(summary), addedIds)
+      .catch((error: unknown) =>
+        this.logger.error('Falha ao publicar a participação gravada', error),
+      );
+  }
+}
