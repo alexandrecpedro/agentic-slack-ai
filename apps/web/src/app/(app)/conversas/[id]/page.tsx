@@ -17,13 +17,21 @@ import {
 } from "@/app/services/chat-api";
 import { readSessionToken } from "@/app/services/session-cookie";
 import { readTimeZone } from "@/app/services/time-zone-cookie";
+import { composerLabel } from "@/app/utils/conversation-title";
+import { MESSAGE_PARAM } from "@/app/utils/jump-to-message";
 import { expiredSessionPath } from "@/app/utils/return-path";
 
 // Uma Conversa: o cabeçalho sai assim que a Conversa é lida, e o histórico (a Pessoa e a página
 // mais recente, pedidas ao mesmo tempo que a Conversa) chega depois, atrás de "Histórico
 // carregando" (spec da F02, "Leituras").
-export default async function ConversationPage({ params }: PageProps<"/conversas/[id]">) {
+export default async function ConversationPage({
+  params,
+  searchParams,
+}: PageProps<"/conversas/[id]">) {
   const { id } = await params;
+  // A Mensagem pedida pela URL (spec da F08, "Abrir a Conversa na Mensagem").
+  const requested = (await searchParams)[MESSAGE_PARAM];
+  const messageParam = typeof requested === "string" ? requested : null;
   const path = `/conversas/${id}`;
   const token = await readSessionToken();
   if (!token) redirect(expiredSessionPath(path));
@@ -47,22 +55,34 @@ export default async function ConversationPage({ params }: PageProps<"/conversas
   }
 
   const { conversation } = conversationResult;
+  // A Pessoa da Sessão já foi pedida junto com a Conversa: com ela, a caixa de mensagem da Conversa
+  // consigo mesma diz "você" desde o carregamento.
+  const personResult = await person;
+  const selfId = personResult.kind === "ok" ? personResult.person.id : null;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <RememberConversation conversationId={conversation.id} />
       <ConversationHeader
-        name={conversation.name}
-        topic={conversation.topic}
-        kind={conversation.kind}
+        conversation={conversation}
         members={
-          // O botão espera a Pessoa da Sessão sem segurar o cabeçalho.
-          <Suspense fallback={null}>
-            <HeaderMembers conversation={conversation} person={person} />
-          </Suspense>
+          // O botão espera a Pessoa da Sessão sem segurar o cabeçalho. A Conversa direta não tem.
+          conversation.kind !== "direct" && (
+            <Suspense fallback={null}>
+              <HeaderMembers conversation={conversation} person={person} />
+            </Suspense>
+          )
         }
       />
-      <Suspense key={conversation.id} fallback={<HistoryLoading conversationName={conversation.name} />}>
-        <ConversationHistory conversation={conversation} history={history} path={path} />
+      <Suspense
+        key={conversation.id}
+        fallback={<HistoryLoading composerLabel={composerLabel(conversation, selfId)} />}
+      >
+        <ConversationHistory
+          conversation={conversation}
+          history={history}
+          path={path}
+          messageParam={messageParam}
+        />
       </Suspense>
     </div>
   );
@@ -85,26 +105,39 @@ type ConversationHistoryProps = {
   conversation: Conversation;
   history: Promise<[CurrentPersonResult, MessagePageResult]>;
   path: string;
+  messageParam: string | null;
 };
 
-async function ConversationHistory({ conversation, history, path }: ConversationHistoryProps) {
+async function ConversationHistory({
+  conversation,
+  history,
+  path,
+  messageParam,
+}: ConversationHistoryProps) {
   const [[personResult, pageResult], timeZone] = await Promise.all([history, readTimeZone()]);
   if (personResult.kind === "unauthenticated" || pageResult.kind === "unauthenticated") {
     redirect(expiredSessionPath(path));
   }
   if (pageResult.kind === "not_found") notFound();
   if (personResult.kind !== "ok" || pageResult.kind !== "ok") {
-    return <HistoryError conversationName={conversation.name} />;
+    const selfId = personResult.kind === "ok" ? personResult.person.id : null;
+    return <HistoryError composerLabel={composerLabel(conversation, selfId)} />;
   }
 
   const { id: authorId, name, initials } = personResult.person;
+  const renderedAt = new Date().toISOString();
   return (
+    // Cada renderização do servidor monta o histórico de novo: com Cache Components, a Conversa que
+    // a Pessoa deixou fica escondida num <Activity>, e reabri-la pela barra lateral começa da página
+    // que o servidor acabou de ler, sem a Citação ou a edição que estavam abertas.
     <MessageHistory
+      key={renderedAt}
       conversation={conversation}
       initialPage={pageResult.page}
       timeZone={timeZone}
-      renderedAt={new Date().toISOString()}
+      renderedAt={renderedAt}
       currentPerson={{ id: authorId, name, initials }}
+      messageParam={messageParam}
     />
   );
 }

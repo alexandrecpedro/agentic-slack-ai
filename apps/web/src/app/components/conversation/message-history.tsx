@@ -9,12 +9,26 @@ import {
   useRef,
   useState,
 } from "react";
+import { useKnownPerson } from "@/app/components/people/people-provider";
+import { composerLabel, conversationTitle } from "@/app/utils/conversation-title";
+import { toast } from "sonner";
 import { SWRConfig } from "swr";
+import { initCache, noop } from "swr/_internal";
 import { MessageItem } from "@/app/components/message/message-item";
 import { buttonVariants } from "@/app/components/ui/button";
 import { Spinner } from "@/app/components/ui/spinner";
 import { useMessageHistory } from "@/app/hooks/use-message-history";
+import {
+  JUMP_PAGE_SIZE,
+  type JumpTarget,
+  jumpStep,
+  MESSAGE_PARAM,
+  openingTarget,
+} from "@/app/utils/jump-to-message";
+import { firstUnreadId, needsOlderForUnread } from "@/app/utils/unread-opening";
+import { isUuid } from "@/app/utils/uuid";
 import { useRealtimeMessages } from "@/app/hooks/use-realtime-messages";
+import { useReadReport } from "@/app/hooks/use-read-report";
 import { useTypingAnnouncer } from "@/app/hooks/use-typing";
 import {
   type PendingMessage,
@@ -43,6 +57,10 @@ type MessageHistoryProps = {
   renderedAt: string;
   // A Pessoa da Sessão, autora das Mensagens que ainda estão sendo enviadas.
   currentPerson: MessageAuthor;
+  // O `?mensagem=` da URL, lido pela página no servidor (spec da F08, "Abrir a Conversa na
+  // Mensagem"). Não sai de useSearchParams: assinar a URL aqui fazia a página guardada para o voltar
+  // do navegador renderizar com o cache do histórico já desmontado.
+  messageParam: string | null;
 };
 
 // Distância do topo em que o sentinela pede a página anterior (spec da F02, "Lista de Mensagens").
@@ -54,12 +72,36 @@ const END_OF_LIST_PX = 100;
 // Lista de Mensagens e caixa de mensagem de uma Conversa. O cache do SWR é desta montagem: abrir
 // a Conversa de novo começa da página que o servidor acabou de ler.
 export function MessageHistory(props: MessageHistoryProps) {
+  const [config] = useState(privateCache);
   return (
-    <SWRConfig value={{ provider: () => new Map() }}>
+    <SWRConfig value={config}>
       <History {...props} />
     </SWRConfig>
   );
 }
+
+// O cache desta montagem, guardado no estado e registrado no SWR antes de chegar ao `SWRConfig`.
+// Com Cache Components, o Next esconde a página que sai num <Activity>; se o `SWRConfig` registrasse
+// o cache, a limpeza do efeito dele o tiraria do estado global do SWR, e a página escondida que
+// renderiza de novo, ou reaparece antes dos efeitos, quebraria lendo esse estado. Já registrado, ele
+// não sai, e vai embora com a montagem (o estado global é um WeakMap). Sem os eventos de foco e de
+// reconexão, que o histórico não usa e que ninguém soltaria.
+function privateCache() {
+  const cache = new Map();
+  initCache(cache, { initFocus: noop, initReconnect: noop });
+  return { provider: () => cache };
+}
+
+// Tira o `?mensagem=` da URL sem navegar: o roteador do Next acompanha o replaceState.
+function dropMessageParam() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has(MESSAGE_PARAM)) return;
+  url.searchParams.delete(MESSAGE_PARAM);
+  window.history.replaceState(window.history.state, "", url);
+}
+
+// Quanto tempo a Mensagem citada fica destacada ao chegar (spec da F06, "Ir até a Mensagem citada").
+const HIGHLIGHT_MS = 2_000;
 
 function History({
   conversation,
@@ -67,9 +109,49 @@ function History({
   timeZone,
   renderedAt,
   currentPerson,
+  messageParam,
 }: MessageHistoryProps) {
-  const { messages: saved, hasOlder, isLoadingOlder, olderFailed, loadOlder, appendSaved, reloadLatest } =
-    useMessageHistory(conversation.id, initialPage);
+  const {
+    messages: saved,
+    hasOlder,
+    isLoadingOlder,
+    olderFailed,
+    loadOlder,
+    appendSaved,
+    applyEdited,
+    applyDeleted,
+    reloadLatest,
+  } = useMessageHistory(conversation.id, initialPage);
+  // A Mensagem em edição, uma por vez na Conversa (spec da F06, "Edição").
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const closeEdit = useCallback((messageId: string) => {
+    setEditingId((current) => (current === messageId ? null : current));
+  }, []);
+  // A Mensagem que a próxima vai citar (spec da F06, "Citação"). O histórico monta de novo a cada
+  // Conversa, então trocar de Conversa desiste dela.
+  const [quoting, setQuoting] = useState<Message | null>(null);
+  // Os nomes atuais da outra Pessoa da Conversa direta e do autor citado (spec da F09, "Camada de
+  // Pessoas"), para os rótulos.
+  const knownCounterpart = useKnownPerson(conversation.counterpart?.id);
+  const knownQuotingAuthor = useKnownPerson(quoting?.author.id);
+  const titled =
+    knownCounterpart && conversation.counterpart
+      ? { ...conversation, counterpart: { ...conversation.counterpart, name: knownCounterpart.name } }
+      : conversation;
+  // Uma Mensagem que sai da Conversa (spec da F06, "Apagar"): a edição aberta dela fecha, e a Citação
+  // dela sai da caixa, com aviso. O tempo real a chama por um useEffectEvent, que sempre vê o estado
+  // atual.
+  const removeMessage = (messageId: string) => {
+    if (editingId === messageId) {
+      setEditingId(null);
+      toast.info("Essa mensagem foi apagada.");
+    }
+    if (quoting?.id === messageId) {
+      setQuoting(null);
+      toast.info("A mensagem que você estava respondendo foi apagada.");
+    }
+    applyDeleted(messageId);
+  };
   const { pending, send, retry, discard, dropDelivered } = usePendingMessages(
     conversation.id,
     currentPerson,
@@ -78,6 +160,8 @@ function History({
   const { isSynced } = useRealtimeMessages(conversation.id, initialPage, {
     currentPersonId: currentPerson.id,
     appendSaved,
+    applyEdited,
+    applyDeleted: removeMessage,
     dropDelivered,
     reloadLatest,
   });
@@ -121,7 +205,60 @@ function History({
   // layout da renderização que a trouxe).
   const isAtEnd = useRef(true);
   const [hasNewBelow, setHasNewBelow] = useState(false);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+
+  // O divisor de novas Mensagens (spec da F07, "Abrir na primeira Não lida e o divisor"): a Última
+  // leitura guardada ao abrir, só com Não lidas naquele momento, é a referência dele, e ele não se
+  // move enquanto a Pessoa fica na Conversa. Quando o foco da aba volta e chegaram Mensagens sem
+  // foco, a referência passa a ser a Última leitura que o aviso de leitura conhecia.
+  const [dividerAfter, setDividerAfter] = useState<{ lastReadId: string | null } | null>(() =>
+    conversation.unreadCount > 0 ? { lastReadId: conversation.lastReadMessageId } : null,
+  );
+  const firstUnread = useMemo(
+    () => (dividerAfter ? firstUnreadId(saved, dividerAfter.lastReadId, currentPerson.id) : null),
+    [saved, dividerAfter, currentPerson.id],
+  );
+  const newestOfSaved = saved.at(-1);
+  useReadReport({
+    conversationId: conversation.id,
+    personId: currentPerson.id,
+    newestSaved: newestOfSaved && { id: newestOfSaved.id, authorId: newestOfSaved.author.id },
+    initialLastReadId: conversation.lastReadMessageId,
+    isReady: isSynced,
+    // Quando o foco volta e chegaram Mensagens sem foco, a referência do divisor passa a ser a
+    // Última leitura que o aviso conhecia.
+    onFocusReturn: (lastReadId) => {
+      if (firstUnreadId(saved, lastReadId, currentPerson.id)) setDividerAfter({ lastReadId });
+    },
+  });
+  // A ida (spec da F06, "Ir até a Mensagem citada"): até a original de uma Citação, que fica
+  // destacada por 2 s ao chegar, ou, ao abrir com Não lidas, até a primeira delas, com o divisor no
+  // topo da área visível (spec da F07). As páginas anteriores carregam até o alvo estar na lista.
+  // Aberta por `?mensagem=` (Atividade, Alerta, notificação do navegador), a ida vai até a Mensagem
+  // pedida, antes da primeira Não lida (spec da F08, "Abrir a Conversa na Mensagem").
+  const [jumpTarget, setJumpTarget] = useState<JumpTarget | null>(() =>
+    openingTarget(messageParam, dividerAfter),
+  );
+  const isJumping = useRef(jumpTarget !== null);
+  // Se a ida já pediu uma página: só a falha dessa carga encerra a ida, e não uma falha de antes.
+  const jumpRequestedLoad = useRef(false);
   const listRef = useRef<HTMLOListElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  // Depois de apagar a própria Mensagem, o foco vai para a seguinte da lista, ou para a caixa de
+  // mensagem quando ela era a última (spec da F06, "Apagar").
+  const deleteAndMoveFocus = (messageId: string) => {
+    const index = rows.findIndex((row) => row.message.id === messageId);
+    const nextId = index >= 0 ? rows[index + 1]?.message.id : undefined;
+    removeMessage(messageId);
+    requestAnimationFrame(() => {
+      const next = nextId
+        ? listRef.current?.querySelector<HTMLElement>(
+            `[data-message-id="${nextId}"] :is(button, a, textarea):not([tabindex="-1"])`,
+          )
+        : null;
+      (next ?? composerRef.current)?.focus();
+    });
+  };
 
   const measureEnd = useCallback(() => {
     const element = scrollRef.current;
@@ -172,7 +309,8 @@ function History({
     if (previous === undefined) return scrollToEnd();
     if (!newestSavedId || newestSavedId <= previous) return;
     if (newestSavedClientId && sentHere.current.has(newestSavedClientId)) return;
-    if (isAtEnd.current) scrollToEnd();
+    // Indo até a Mensagem citada, a Mensagem nova não puxa a lista para o fim.
+    if (isAtEnd.current && !isJumping.current) scrollToEnd();
     else setHasNewBelow(true);
   }, [newestSavedId, newestSavedClientId, scrollToEnd]);
 
@@ -187,6 +325,115 @@ function History({
     scrollToEnd();
     scrollRef.current?.focus();
   }
+
+  // Rola até a Mensagem, no centro, e a destaca por 2 s.
+  const showMessage = useCallback((messageId: string) => {
+    anchor.current = null;
+    listRef.current
+      ?.querySelector(`[data-message-id="${messageId}"]`)
+      ?.scrollIntoView({ block: "center" });
+    setHighlightedId(messageId);
+  }, []);
+  useEffect(() => {
+    if (!highlightedId) return;
+    const timer = setTimeout(() => setHighlightedId(null), HIGHLIGHT_MS);
+    return () => clearTimeout(timer);
+  }, [highlightedId]);
+
+  // Uma Citação nova toma o lugar de uma ida em andamento.
+  function goToMessage(messageId: string) {
+    if (saved.some((message) => message.id === messageId)) {
+      isJumping.current = false;
+      setJumpTarget(null);
+      // Uma ida pedida pela URL acaba aqui também: a URL perde o parâmetro.
+      dropMessageParam();
+      return showMessage(messageId);
+    }
+    isJumping.current = true;
+    jumpRequestedLoad.current = false;
+    setJumpTarget({ kind: "message", id: messageId });
+  }
+
+  // Leva o divisor ao topo da área visível, se ele ficou fora dela; à vista, a lista fica no fim.
+  const showDivider = useCallback(() => {
+    const element = scrollRef.current;
+    const divider = listRef.current?.querySelector("[data-unread-divider]");
+    if (!element || !divider) return;
+    const area = element.getBoundingClientRect();
+    const { top } = divider.getBoundingClientRect();
+    if (top >= area.top && top <= area.bottom) return;
+    anchor.current = null;
+    divider.scrollIntoView({ block: "start" });
+    measureEnd();
+  }, [measureEnd]);
+
+  // Sem a original na lista, carrega as páginas anteriores, maiores, até achá-la ou até saber que
+  // ela não está mais lá.
+  const stepFor = (target: JumpTarget | null) => target
+    ? target.kind === "message"
+      ? jumpStep(saved, target.id, hasOlder)
+      : needsOlderForUnread(saved, target.lastReadId, hasOlder)
+        ? "continue"
+        : "found"
+    : null;
+  const step = stepFor(jumpTarget);
+  // Enquanto as anteriores carregam até a primeira Não lida, o divisor não aparece: ficaria acima da
+  // Mensagem mais antiga carregada, que ainda não é a primeira Não lida.
+  // Vale também quando a ida vai até a Mensagem pedida pela URL e não passa pela Última leitura.
+  const shownUnread =
+    dividerAfter && needsOlderForUnread(saved, dividerAfter.lastReadId, hasOlder) ? null : firstUnread;
+  const advanceJump = useEffectEvent(() => {
+    if (!jumpTarget || !step) return;
+    const isUnread = jumpTarget.kind === "unread";
+    // A ida termina, achando ou não; a pedida pela URL tira o parâmetro dela, sem renderizar a
+    // página de novo no servidor, e recarregar não vai de novo.
+    const finish = () => {
+      isJumping.current = false;
+      setJumpTarget(null);
+      if (!isUnread) dropMessageParam();
+    };
+    if (step === "continue") {
+      if (isLoadingOlder) return;
+      if (olderFailed && jumpRequestedLoad.current) {
+        finish();
+        // Sem chegar à primeira Não lida, a Conversa fica onde está, sem divisor: ele ficaria
+        // acima de uma Mensagem com Não lidas antes dela.
+        if (isUnread) setDividerAfter(null);
+        else toast.error("Não foi possível ir até a mensagem.");
+        return;
+      }
+      jumpRequestedLoad.current = true;
+      loadOlder(JUMP_PAGE_SIZE);
+      return;
+    }
+    finish();
+    if (isUnread) showDivider();
+    else if (step === "found") showMessage(jumpTarget.id);
+    else toast("A mensagem não está mais disponível");
+  });
+  // Um `?mensagem=` novo com a Conversa já aberta (um Alerta da mesma Conversa) começa outra ida,
+  // como uma Citação nova; o da abertura já é o alvo inicial. Cada navegação renderiza a página de
+  // novo, com outro `renderedAt`: pedir de novo a mesma Mensagem também é um pedido novo.
+  const request = messageParam === null ? null : `${messageParam}@${renderedAt}`;
+  // O da abertura já é o alvo inicial; um valor que não é um id fica para o efeito tirar da URL.
+  const handledRequest = useRef(messageParam && isUuid(messageParam) ? request : null);
+  const goToRequested = useEffectEvent((messageId: string) => goToMessage(messageId));
+  useEffect(() => {
+    if (messageParam === null || request === handledRequest.current) return;
+    handledRequest.current = request;
+    // Um valor que não é um id, inclusive o vazio, não leva a lugar nenhum e sai da URL.
+    if (!isUuid(messageParam)) return dropMessageParam();
+    // No quadro seguinte, como os passos da ida.
+    const frame = requestAnimationFrame(() => goToRequested(messageParam.toLowerCase()));
+    return () => cancelAnimationFrame(frame);
+  }, [messageParam, request]);
+  // A cada página que chega (ou falha), o próximo passo da ida, no quadro seguinte, depois de a lista
+  // nova estar na tela.
+  useEffect(() => {
+    if (!jumpTarget) return;
+    const frame = requestAnimationFrame(() => advanceJump());
+    return () => cancelAnimationFrame(frame);
+  }, [jumpTarget, step, isLoadingOlder, olderFailed]);
 
   // Quando a página anterior entra no começo, a Mensagem que a Pessoa lia fica no mesmo lugar: a
   // rolagem é devolvida pela posição da âncora, sem depender do overflow-anchor do navegador.
@@ -247,7 +494,7 @@ function History({
           ref={scrollRef}
           onScroll={measureEnd}
           role="region"
-          aria-label={`Histórico de #${conversation.name}`}
+          aria-label={`Histórico de ${conversationTitle(titled)}`}
           // Marca o histórico em dia com o tempo real, que os testes esperam antes de agir.
           data-synced={isSynced ? "" : undefined}
           tabIndex={0}
@@ -276,28 +523,57 @@ function History({
               </button>
             </div>
           ) : (
-            <ConversationIntro
-              name={conversation.name}
-              topic={conversation.topic}
-              kind={conversation.kind}
-            />
+            <ConversationIntro conversation={conversation} selfId={currentPerson.id} />
           )}
-          <ol ref={listRef} aria-label={`Mensagens em #${conversation.name}`} className="flex flex-col">
+          <ol ref={listRef} aria-label={`Mensagens em ${conversationTitle(titled)}`} className="flex flex-col">
             {rows.map(({ message, compact, dayLabel }) => (
               <MessageItem
                 // Pela autora e pelo client_id, a Mensagem "enviando" vira a gravada no mesmo item.
                 key={`${message.author.id}:${message.clientId}`}
                 message={message}
                 timeZone={timeZone}
-                compact={compact}
+                // A primeira Não lida mostra a autora, logo abaixo do divisor.
+                compact={compact && message.id !== shownUnread}
                 dayLabel={dayLabel}
+                unreadDivider={message.id === shownUnread}
                 status={message.status ?? "sent"}
+                currentPersonId={currentPerson.id}
+                onGoToQuote={goToMessage}
+                highlighted={highlightedId === message.id}
+                onReply={
+                  message.status
+                    ? undefined
+                    : () => {
+                        setQuoting(message);
+                        composerRef.current?.focus();
+                      }
+                }
                 onRetry={message.status ? () => retryAndFollow(message as PendingMessage) : undefined}
                 onDiscard={message.status ? () => discard(message.clientId) : undefined}
+                failure={message.status ? (message as PendingMessage).failure : undefined}
+                edit={
+                  message.author.id === currentPerson.id && !message.status
+                    ? {
+                        isEditing: editingId === message.id,
+                        start: () => setEditingId(message.id),
+                        onSaved: applyEdited,
+                        onClose: () => closeEdit(message.id),
+                        onDeleted: () => deleteAndMoveFocus(message.id),
+                      }
+                    : undefined
+                }
               />
             ))}
           </ol>
         </div>
+        {step === "continue" ? (
+          <div className="absolute left-1/2 top-2 -translate-x-1/2" role="status">
+            <span className="flex animate-pop-in items-center gap-2 rounded-pill border border-border bg-surface-raised px-3 py-1 text-small text-fg shadow-2">
+              <Spinner size="sm" />
+              Indo até a mensagem…
+            </span>
+          </div>
+        ) : null}
         {hasNewBelow ? (
           <div className="absolute bottom-2 left-1/2 -translate-x-1/2">
             <NewMessagesPill onClick={goToNewMessages} />
@@ -306,9 +582,21 @@ function History({
       </div>
       <TypingIndicator conversationId={conversation.id} />
       <MessageComposer
-        conversationName={conversation.name}
+        inputRef={composerRef}
+        conversationId={conversation.id}
+        quoting={
+          quoting && {
+            authorName: knownQuotingAuthor?.name ?? quoting.author.name,
+            body: quoting.body,
+          }
+        }
+        onCancelQuote={() => setQuoting(null)}
+        label={composerLabel(titled, currentPerson.id)}
         onTextChange={typing.onTextChange}
-        onSend={send}
+        onSend={(body) => {
+          send(body, quoting ?? undefined);
+          setQuoting(null);
+        }}
       />
     </div>
   );

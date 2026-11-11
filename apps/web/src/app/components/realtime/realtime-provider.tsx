@@ -1,20 +1,29 @@
 "use client";
 
 import type {
+  ActivityUnreadEvent,
   ClientToServerEvents,
   ConversationMemberAddedEvent,
+  ConversationUnreadEvent,
   HandshakeErrorCode,
   MessageCreatedEvent,
+  MessageDeletedEvent,
+  MessageUpdatedEvent,
+  PersonUpdatedEvent,
+  PresenceChangedEvent,
   ServerToClientEvents,
+  StoredEvent,
+  StoredEventName,
   SyncEvent,
 } from "chat-events";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import type { Conversation, Message } from "@/app/services/chat-api";
-import { conversationFromPayload } from "@/app/utils/conversation-event";
+import type { ActivityUnread, Conversation, Message, Unread } from "@/app/services/chat-api";
+import { activityUnreadFromPayload } from "@/app/utils/activity-unread";
+import { conversationFromPayload, unreadFromPayload } from "@/app/utils/conversation-event";
 import { laterCursor, orderForSync } from "@/app/utils/event-cursor";
 import { messageFromEvent } from "@/app/utils/message-event";
-import { rememberMessage } from "@/app/utils/recent-messages";
+import { forgetMessage, rememberEdit, rememberMessage } from "@/app/utils/recent-messages";
 import { clearLeaving, hasAskedToLeave } from "@/app/utils/leaving";
 import { redirectToExpiredSession } from "@/app/utils/return-path";
 
@@ -22,13 +31,34 @@ export type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
 export type RealtimeStatus = "connecting" | "connected" | "disconnected";
 
+export type MessageDeleted = { conversationId: string; messageId: string };
+
 // Pessoas que entraram numa Conversa (spec da F04, "Tempo real").
 export type MemberAdded = { conversation: Conversation; personIds: readonly string[] };
 
+// A Última leitura e os números de uma Conversa, calculados pelo servidor (spec da F07).
+export type ConversationUnread = { conversationId: string; unread: Unread };
+
+// Como a Mensagem chegou: no reenvio da reconexão (os eventos guardados enquanto a conexão
+// sincronizava) ou ao vivo. Só a ao vivo alerta (spec da F08, "Alerta e notificação do navegador").
+export type MessageArrival = { isReplay: boolean };
+
 export type RealtimeListener = {
-  onMessage?: (message: Message) => void;
+  onMessage?: (message: Message, arrival: MessageArrival) => void;
+  // Uma Mensagem editada (spec da F06, "Eventos no cliente").
+  onMessageUpdated?: (message: Message) => void;
+  // Uma Mensagem apagada, que sai da Conversa (spec da F06, "Eventos no cliente").
+  onMessageDeleted?: (event: MessageDeleted) => void;
   onMemberAdded?: (event: MemberAdded) => void;
+  onUnread?: (event: ConversationUnread) => void;
+  // Os números de Atividade, calculados pelo servidor (spec da F08, "Tempo real").
+  onActivityUnread?: (unread: ActivityUnread) => void;
   onSync?: (event: SyncEvent) => void;
+  // O Perfil que mudou, para todo o workspace, sem guardar nem reenviar (spec da F09, "Tempo real").
+  // Assinado aqui, e não direto no socket, para não perder o que chega logo depois da conexão.
+  onPersonUpdated?: (event: PersonUpdatedEvent) => void;
+  // A Presença que mudou, para todo o workspace, sem guardar (spec da F09, "Tempo real").
+  onPresenceChanged?: (event: PresenceChangedEvent) => void;
   // Quem assina depois do sync recebe, por padrão, uma cópia sem reset. Com esta marca, recebe o
   // reset do último sync: é o caso de quem não guarda os eventos que perdeu, como a lista de
   // Conversas da barra lateral.
@@ -58,11 +88,16 @@ const RealtimeContext = createContext<RealtimeContextValue>({
 
 const UNAUTHENTICATED: HandshakeErrorCode = "unauthenticated";
 
-// Um evento guardado por Pessoa, com o cursor dele à vista para a ordem até o sync.
-type StoredEvent = { event_id?: string } & (
-  | { name: "message.created"; event: MessageCreatedEvent }
-  | { name: "conversation.member_added"; event: ConversationMemberAddedEvent }
-);
+// Um evento guardado por Pessoa (StoredEventPayloads, em chat-events), com o nome dele, até o
+// sync.
+type ReceivedEvent = {
+  [N in StoredEventName]: { name: N; event: StoredEvent<N> };
+}[StoredEventName];
+
+// O tratamento de cada evento guardado, com a carga do evento daquele nome.
+type StoredEventHandlers = {
+  [N in StoredEventName]: (event: StoredEvent<N>) => void;
+};
 
 // Intervalo de uma nova tentativa depois de um handshake recusado por outro motivo, igual ao da
 // reconexão padrão do cliente do Socket.IO: começa em 1 s e dobra até 5 s.
@@ -100,15 +135,22 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
     // O cursor do último evento recebido, mandado a cada handshake (spec da F03, "Conexão por aba"):
     // a API reenvia o que veio depois dele.
     let cursor: string | null = null;
+    let sentCursor = false;
     const socket: RealtimeSocket = io(url, {
       transports: ["websocket"],
       withCredentials: true,
-      auth: (send) => send(cursor ? { cursor } : {}),
+      auth: (send) => {
+        // Só uma conexão que manda cursor recebe o reenvio do que perdeu.
+        sentCursor = cursor !== null;
+        send(cursor ? { cursor } : {});
+      },
     });
     // Até o sync de cada conexão, os eventos ficam guardados: a sala da Pessoa já recebe os novos
     // enquanto a API reenvia os perdidos, e a ordem é a do cursor.
     let isSyncing = true;
-    let pendingEvents: StoredEvent[] = [];
+    let pendingEvents: ReceivedEvent[] = [];
+    // Verdadeiro enquanto o sync de uma reconexão aplica os eventos guardados.
+    let isReplaying = false;
     let retryDelay = RETRY_MIN_MS;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     const setStatus = (status: RealtimeStatus) =>
@@ -144,6 +186,12 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
       setStatus("disconnected");
     });
     socket.on("session.ended", endSession);
+    socket.on("person.updated", (event) => {
+      listeners.current.forEach((listener) => listener.onPersonUpdated?.(event));
+    });
+    socket.on("presence.changed", (event) => {
+      listeners.current.forEach((listener) => listener.onPresenceChanged?.(event));
+    });
     socket.on("connect_error", (error) => {
       if (error.message === UNAUTHENTICATED) {
         void redirectToExpiredSession();
@@ -163,7 +211,24 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
         message.conversationId,
         rememberMessage(received.get(message.conversationId) ?? [], message),
       );
-      listeners.current.forEach((listener) => listener.onMessage?.(message));
+      const arrival = { isReplay: isReplaying };
+      listeners.current.forEach((listener) => listener.onMessage?.(message, arrival));
+    };
+    const applyMessageUpdated = (event: MessageUpdatedEvent) => {
+      const message = messageFromEvent(event.message);
+      const recentOfConversation = received.get(message.conversationId);
+      if (recentOfConversation) {
+        received.set(message.conversationId, rememberEdit(recentOfConversation, message));
+      }
+      listeners.current.forEach((listener) => listener.onMessageUpdated?.(message));
+    };
+    const applyMessageDeleted = (event: MessageDeletedEvent) => {
+      const deleted = { conversationId: event.conversation_id, messageId: event.message_id };
+      const recentOfConversation = received.get(deleted.conversationId);
+      if (recentOfConversation) {
+        received.set(deleted.conversationId, forgetMessage(recentOfConversation, deleted.messageId));
+      }
+      listeners.current.forEach((listener) => listener.onMessageDeleted?.(deleted));
     };
     const applyMemberAdded = (event: ConversationMemberAddedEvent) => {
       const added = {
@@ -172,24 +237,48 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
       };
       listeners.current.forEach((listener) => listener.onMemberAdded?.(added));
     };
+    const applyUnread = (event: ConversationUnreadEvent) => {
+      const changed = { conversationId: event.conversation_id, unread: unreadFromPayload(event) };
+      listeners.current.forEach((listener) => listener.onUnread?.(changed));
+    };
+    const applyActivityUnread = (event: ActivityUnreadEvent) => {
+      const unread = activityUnreadFromPayload(event);
+      listeners.current.forEach((listener) => listener.onActivityUnread?.(unread));
+    };
+    // Uma entrada por evento guardado: um evento novo no contrato não compila até ter a sua.
+    const handlers: StoredEventHandlers = {
+      "message.created": applyMessage,
+      "message.updated": applyMessageUpdated,
+      "message.deleted": applyMessageDeleted,
+      "conversation.member_added": applyMemberAdded,
+      "conversation.unread": applyUnread,
+      "activity.unread": applyActivityUnread,
+    };
     // Os eventos guardados por Pessoa, na ordem do cursor: aplica e avança o cursor.
-    const apply = (stored: StoredEvent) => {
-      cursor = laterCursor(cursor, stored.event_id);
-      if (stored.name === "message.created") applyMessage(stored.event);
-      else applyMemberAdded(stored.event);
+    const apply = ({ name, event }: ReceivedEvent) => {
+      cursor = laterCursor(cursor, event.event_id);
+      (handlers[name] as (event: StoredEvent) => void)(event);
     };
-    const receive = (stored: StoredEvent) => {
-      if (isSyncing) pendingEvents.push(stored);
-      else apply(stored);
+    const receive = (received: ReceivedEvent) => {
+      if (isSyncing) pendingEvents.push(received);
+      else apply(received);
     };
-    socket.on("message.created", (event) =>
-      receive({ name: "message.created", event, event_id: event.event_id }),
-    );
-    socket.on("conversation.member_added", (event) =>
-      receive({ name: "conversation.member_added", event, event_id: event.event_id }),
-    );
+    // O on tipado do Socket.IO não aceita um nome genérico; o par nome e carga vem do contrato.
+    const untypedSocket = socket as unknown as {
+      on(name: StoredEventName, listener: (event: StoredEvent) => void): void;
+    };
+    for (const name of Object.keys(handlers) as StoredEventName[]) {
+      untypedSocket.on(name, (event) => receive({ name, event } as ReceivedEvent));
+    }
     socket.on("sync", (event) => {
-      orderForSync(pendingEvents).forEach(apply);
+      // O que ficou guardado até o sync de uma reconexão com cursor é, quase todo, o reenvio do que a
+      // aba perdeu; na primeira conexão não há reenvio, e o que chegou é novo.
+      isReplaying = sentCursor;
+      try {
+        orderForSync(pendingEvents, (received) => received.event.event_id).forEach(apply);
+      } finally {
+        isReplaying = false;
+      }
       pendingEvents = [];
       isSyncing = false;
       cursor = laterCursor(cursor, event.cursor);
@@ -227,7 +316,9 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
   const subscribe = useCallback((listener: RealtimeListener) => {
     listeners.current.add(listener);
     const pending = pendingReset.current;
-    if (pending && listener.onSync) {
+    // Quem assina com replayLastReset (a barra lateral, a Atividade) recebe o reset do último sync de
+    // todo jeito e não consome o guardado para o histórico.
+    if (pending && listener.onSync && !listener.replayLastReset) {
       pendingReset.current = null;
       listener.onSync(pending);
     } else if (lastSync.current && listener.onSync) {

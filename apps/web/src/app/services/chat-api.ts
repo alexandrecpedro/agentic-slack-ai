@@ -1,24 +1,58 @@
-import type { ConversationPayload, MessagePayload } from "chat-events";
+import type {
+  ConversationPayload,
+  MentionPayload,
+  MessagePayload,
+  QuotePayload,
+  Presence,
+  StatusEmoji,
+  StatusPayload,
+} from "chat-events";
 import { connection } from "next/server";
 import { cache } from "react";
 import { env } from "@/app/config/env";
-import { conversationFromPayload } from "@/app/utils/conversation-event";
+import {
+  conversationFromPayload,
+  listedConversationFromPayload,
+  type ListedConversationPayload,
+  unreadFromPayload,
+  type UnreadPayload,
+} from "@/app/utils/conversation-event";
 import { initials } from "@/app/utils/initials";
+import type { Theme } from "@/app/utils/theme";
 import { messageFromEvent } from "@/app/utils/message-event";
+import { activityUnreadFromPayload, type ActivityUnreadPayload } from "@/app/utils/activity-unread";
 
 // Service HTTP da API do chat, usado só no servidor (Server Actions, Server Components e
 // Route Handlers). Devolve uniões de resultado em vez de lançar.
 
 const TIMEOUT_MS = 5000;
 
-type ApiPerson = { id: string; name: string; email: string };
+// O Status de uma Pessoa (spec da F09, "Pessoas"): a chave do emoji e a mensagem.
+export type Status = StatusPayload;
+
+type ApiPerson = {
+  id: string;
+  name: string;
+  email: string;
+  username: string;
+  time_zone: string | null;
+  status: Status | null;
+  presence_choice: Presence;
+  // O tema escolhido (spec da F09, "Pessoas").
+  theme: Theme;
+};
 
 // As iniciais saem aqui, no servidor, e seguem prontas para os componentes do cliente
 // (utils/initials.ts).
-export type Person = ApiPerson & { initials: string };
+export type Person = Omit<ApiPerson, "time_zone" | "presence_choice"> & {
+  initials: string;
+  timeZone: string | null;
+  // A escolha de presença (spec da F09, "Pessoas").
+  presenceChoice: Presence;
+};
 
-function toPerson(person: ApiPerson): Person {
-  return withInitials(person);
+function toPerson({ time_zone: timeZone, presence_choice: presenceChoice, ...person }: ApiPerson): Person {
+  return { ...withInitials(person), timeZone, presenceChoice };
 }
 
 export type LoginResult =
@@ -131,14 +165,25 @@ export async function logout(token: string): Promise<void> {
 
 // Conversas e Mensagens (spec da F02, "Rotas").
 
-export type ConversationKind = "public_channel" | "private_channel";
+export type ConversationKind = "public_channel" | "private_channel" | "direct";
+
+// A outra Pessoa de uma Conversa direta (a própria, na Conversa consigo mesma), com as iniciais.
+export type Counterpart = { id: string; name: string; username: string; initials: string };
 
 export type Conversation = {
   id: string;
   kind: ConversationKind;
+  // Vazio na Conversa direta, que não tem nome.
   name: string;
   topic: string | null;
   memberCount: number;
+  // Só na Conversa direta (spec da F05, "Conversa direta").
+  counterpart: Counterpart | null;
+  // A Última leitura e o que a Pessoa tem de novo, só na lista de Conversas (spec da F07, "Rotas");
+  // a Conversa que chega por outro caminho entra com nula e zero.
+  lastReadMessageId: string | null;
+  unreadCount: number;
+  mentionCount: number;
 };
 
 // A Conversa da API é a mesma do evento do tempo real (pacote chat-events).
@@ -149,6 +194,17 @@ type ApiMessage = MessagePayload;
 
 // Uma Pessoa com as iniciais já calculadas, para o avatar.
 export type PersonSummary = { id: string; name: string; initials: string };
+
+// Uma Pessoa nas listas de Pessoas (busca e Membros), com o @usuário e o cargo (spec da F05,
+// "Pessoa nas listas").
+export type PersonEntry = PersonSummary & {
+  username: string;
+  title: string | null;
+  status: Status | null;
+  presence?: Presence;
+};
+
+type ApiPersonEntry = Omit<PersonEntry, "initials">;
 
 function withInitials<T extends { name: string }>(person: T): T & { initials: string } {
   return { ...person, initials: initials(person.name) };
@@ -163,7 +219,16 @@ export type Message = {
   author: MessageAuthor;
   body: string;
   createdAt: string;
+  // A hora da última edição, ou nulo (spec da F06, "A Mensagem no REST e nos eventos").
+  editedAt: string | null;
+  // As Pessoas mencionadas, resolvidas ao gravar (spec da F06, "Texto da Mensagem").
+  mentions: Mention[];
+  // A Citação, com o autor e o texto atual da original, ou a marca de apagada (spec da F06).
+  quote: Quote | null;
 };
+
+export type Mention = MentionPayload;
+export type Quote = QuotePayload;
 
 export type MessagePage = { messages: Message[]; hasMore: boolean };
 
@@ -196,6 +261,8 @@ export type SendMessageResult =
   | { kind: "ok"; message: Message }
   | { kind: "invalid" }
   | { kind: "not_found" }
+  // A Mensagem citada não existe mais nesta Conversa (spec da F06, "Citação").
+  | { kind: "quote_not_found" }
   | { kind: "unauthenticated" }
   | { kind: "failure" };
 
@@ -229,9 +296,9 @@ async function getJson<T>(token: string, path: string): Promise<GetResult<T>> {
 export const listConversations = cache(fetchConversations);
 
 async function fetchConversations(token: string): Promise<ConversationsResult> {
-  const result = await getJson<{ conversations: ApiConversation[] }>(token, "/v1/conversations");
+  const result = await getJson<{ conversations: ListedConversationPayload[] }>(token, "/v1/conversations");
   if (result.kind === "ok") {
-    return { kind: "ok", conversations: result.body.conversations.map(conversationFromPayload) };
+    return { kind: "ok", conversations: result.body.conversations.map(listedConversationFromPayload) };
   }
   // A lista não tem 404: só a Sessão recusada ou a falha.
   return result.kind === "unauthenticated" ? result : { kind: "failure" };
@@ -241,9 +308,9 @@ export async function getConversation(
   token: string,
   id: string,
 ): Promise<ConversationResult> {
-  const result = await getJson<{ conversation: ApiConversation }>(token, conversationPath(id));
+  const result = await getJson<{ conversation: ListedConversationPayload }>(token, conversationPath(id));
   return result.kind === "ok"
-    ? { kind: "ok", conversation: conversationFromPayload(result.body.conversation) }
+    ? { kind: "ok", conversation: listedConversationFromPayload(result.body.conversation) }
     : result;
 }
 
@@ -278,9 +345,12 @@ export async function createChannel(
 export async function listMessages(
   token: string,
   conversationId: string,
-  { before }: { before?: string } = {},
+  { before, limit }: { before?: string; limit?: number } = {},
 ): Promise<MessagePageResult> {
-  const query = before ? `?before=${encodeURIComponent(before)}` : "";
+  const params = new URLSearchParams();
+  if (before) params.set("before", before);
+  if (limit !== undefined) params.set("limit", String(limit));
+  const query = params.size > 0 ? `?${params.toString()}` : "";
   const result = await getJson<{ messages: ApiMessage[]; has_more: boolean }>(
     token,
     conversationPath(conversationId, `/messages${query}`),
@@ -295,12 +365,16 @@ export async function listMessages(
 export async function sendMessage(
   token: string,
   conversationId: string,
-  message: { clientId: string; body: string },
+  message: { clientId: string; body: string; quotedMessageId?: string },
 ): Promise<SendMessageResult> {
   const response = await request(conversationPath(conversationId, "/messages"), {
     method: "POST",
     headers: { ...authenticated(token), "content-type": "application/json" },
-    body: JSON.stringify({ client_id: message.clientId, body: message.body }),
+    body: JSON.stringify({
+      client_id: message.clientId,
+      body: message.body,
+      quoted_message_id: message.quotedMessageId,
+    }),
   });
   if (response?.status === 201) {
     const body = await jsonBody<{ message: ApiMessage }>(response);
@@ -308,13 +382,102 @@ export async function sendMessage(
     return { kind: "failure" };
   }
   if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 404 && (await errorCode(response)) === "quoted_message_not_found") {
+    return { kind: "quote_not_found" };
+  }
+  return commonFailure(response);
+}
+
+// Editar a própria Mensagem (spec da F06, "Rotas").
+
+export type EditMessageResult =
+  | { kind: "ok"; message: Message }
+  | { kind: "invalid" }
+  | { kind: "not_found" }
+  | { kind: "forbidden" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export async function editMessage(
+  token: string,
+  conversationId: string,
+  messageId: string,
+  body: string,
+): Promise<EditMessageResult> {
+  const response = await request(
+    conversationPath(conversationId, `/messages/${encodeURIComponent(messageId)}`),
+    {
+      method: "PATCH",
+      headers: { ...authenticated(token), "content-type": "application/json" },
+      body: JSON.stringify({ body }),
+    },
+  );
+  if (response?.status === 200) {
+    const parsed = await jsonBody<{ message: ApiMessage }>(response);
+    if (parsed) return { kind: "ok", message: messageFromEvent(parsed.message) };
+    return { kind: "failure" };
+  }
+  if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 403) return { kind: "forbidden" };
+  return commonFailure(response);
+}
+
+// Ler a Conversa até uma Mensagem (spec da F07, "Rotas").
+
+export type Unread = Pick<Conversation, "lastReadMessageId" | "unreadCount" | "mentionCount">;
+
+export type MarkReadResult =
+  | { kind: "ok"; unread: Unread }
+  | { kind: "not_found" }
+  | { kind: "invalid" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export async function markConversationRead(
+  token: string,
+  conversationId: string,
+  messageId: string,
+): Promise<MarkReadResult> {
+  const response = await request(conversationPath(conversationId, "/read"), {
+    method: "PUT",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ message_id: messageId }),
+  });
+  if (response?.status === 200) {
+    const parsed = await jsonBody<UnreadPayload>(response);
+    return parsed ? { kind: "ok", unread: unreadFromPayload(parsed) } : { kind: "failure" };
+  }
+  if (response?.status === 400) return { kind: "invalid" };
+  return commonFailure(response);
+}
+
+// Apagar a própria Mensagem (spec da F06, "Rotas").
+
+export type DeleteMessageResult =
+  | { kind: "ok" }
+  | { kind: "not_found" }
+  | { kind: "forbidden" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export async function deleteMessage(
+  token: string,
+  conversationId: string,
+  messageId: string,
+): Promise<DeleteMessageResult> {
+  const response = await request(
+    conversationPath(conversationId, `/messages/${encodeURIComponent(messageId)}`),
+    { method: "DELETE", headers: authenticated(token) },
+  );
+  if (response?.status === 204) return { kind: "ok" };
+  if (response?.status === 403) return { kind: "forbidden" };
   return commonFailure(response);
 }
 
 // Busca de Pessoas e adição ao Canal privado (spec da F04, "Rotas").
 
 export type SearchPeopleResult =
-  | { kind: "ok"; people: PersonSummary[] }
+  | { kind: "ok"; people: PersonEntry[] }
   | { kind: "invalid" }
   | { kind: "not_found" }
   | { kind: "unauthenticated" }
@@ -322,17 +485,194 @@ export type SearchPeopleResult =
 
 export async function searchPeople(
   token: string,
-  { q, notMemberOf }: { q: string; notMemberOf: string },
+  { q, notMemberOf, memberOf }: { q: string; notMemberOf?: string; memberOf?: string },
 ): Promise<SearchPeopleResult> {
-  const query = new URLSearchParams({ q, not_member_of: notMemberOf });
+  // Sem a Conversa, a busca do "Nova conversa" (spec da F05, "Busca"); com member_of, a lista de
+  // menções (spec da F06).
+  const query = new URLSearchParams({ q });
+  if (notMemberOf !== undefined) query.set("not_member_of", notMemberOf);
+  if (memberOf !== undefined) query.set("member_of", memberOf);
   const response = await request(`/v1/people?${query.toString()}`, {
     method: "GET",
     headers: authenticated(token),
   });
   if (response?.status === 400) return { kind: "invalid" };
   if (response?.status !== 200) return commonFailure(response);
-  const body = await jsonBody<{ people: { id: string; name: string }[] }>(response);
+  const body = await jsonBody<{ people: ApiPersonEntry[] }>(response);
   return body ? { kind: "ok", people: body.people.map(withInitials) } : { kind: "failure" };
+}
+
+// O Perfil de uma Pessoa (spec da F05, "Busca e Perfil"), com as iniciais para o avatar.
+export type Profile = {
+  id: string;
+  name: string;
+  initials: string;
+  username: string;
+  title: string | null;
+  email: string;
+  phone: string | null;
+  timeZone: string | null;
+  status: Status | null;
+  presence?: Presence;
+};
+
+type ApiProfile = Omit<Profile, "initials" | "timeZone"> & { time_zone: string | null };
+
+function toProfile({ time_zone: timeZone, ...person }: ApiProfile): Profile {
+  return { ...withInitials(person), timeZone };
+}
+
+export type GetProfileResult =
+  | { kind: "ok"; profile: Profile }
+  | { kind: "not_found" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export async function getProfile(token: string, personId: string): Promise<GetProfileResult> {
+  const response = await request(`/v1/people/${encodeURIComponent(personId)}`, {
+    method: "GET",
+    headers: authenticated(token),
+  });
+  if (response?.status !== 200) return commonFailure(response);
+  const body = await jsonBody<{ person: ApiProfile }>(response);
+  if (!body) return { kind: "failure" };
+  return { kind: "ok", profile: toProfile(body.person) };
+}
+
+export type UpdateProfileResult =
+  | { kind: "ok"; profile: Profile }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Grava o próprio Perfil (spec da F09, "Rotas"). O 400 que escape da validação do BFF vira falha:
+// a mensagem de cada campo é a da web.
+export async function updateProfile(
+  token: string,
+  changes: {
+    name: string;
+    title: string | null;
+    phone: string | null;
+    status_emoji: StatusEmoji | null;
+    status_text: string | null;
+  },
+): Promise<UpdateProfileResult> {
+  const response = await request("/v1/people/me", {
+    method: "PATCH",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify(changes),
+  });
+  if (response?.status === 401) return { kind: "unauthenticated" };
+  if (response?.status !== 200) return { kind: "failure" };
+  const body = await jsonBody<{ person: ApiProfile }>(response);
+  if (!body) return { kind: "failure" };
+  return { kind: "ok", profile: toProfile(body.person) };
+}
+
+// Uma Pessoa no retrato: quem está disponível ou tem Status (spec da F09, "Rotas").
+export type PresenceEntry = { id: string; presence: Presence; status: Status | null };
+
+export type PresenceResult =
+  | { kind: "ok"; people: PresenceEntry[] }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// O retrato de quem tem Status (spec da F09, "Rotas").
+export async function getPresence(token: string): Promise<PresenceResult> {
+  const response = await request("/v1/people/presence", {
+    method: "GET",
+    headers: authenticated(token),
+  });
+  if (response?.status === 401) return { kind: "unauthenticated" };
+  if (response?.status !== 200) return { kind: "failure" };
+  const body = await jsonBody<{ people: PresenceEntry[] }>(response);
+  return body ? { kind: "ok", people: body.people } : { kind: "failure" };
+}
+
+export type SavePresenceChoiceResult =
+  | { kind: "ok" }
+  | { kind: "invalid" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Grava a escolha de presença (spec da F09, "Rotas").
+export async function savePresenceChoice(
+  token: string,
+  choice: Presence,
+): Promise<SavePresenceChoiceResult> {
+  const response = await request("/v1/people/me/presence", {
+    method: "PUT",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ presence_choice: choice }),
+  });
+  if (response?.status === 204) return { kind: "ok" };
+  if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 401) return { kind: "unauthenticated" };
+  return { kind: "failure" };
+}
+
+export type SaveThemeResult =
+  | { kind: "ok" }
+  | { kind: "invalid" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Grava o tema (spec da F09, "Rotas").
+export async function saveTheme(token: string, theme: Theme): Promise<SaveThemeResult> {
+  const response = await request("/v1/people/me/theme", {
+    method: "PUT",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ theme }),
+  });
+  if (response?.status === 204) return { kind: "ok" };
+  if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 401) return { kind: "unauthenticated" };
+  return { kind: "failure" };
+}
+
+export type OpenDirectConversationResult =
+  | { kind: "ok"; conversation: Conversation }
+  | { kind: "invalid" }
+  | { kind: "not_found" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Abre a Conversa direta com a Pessoa (spec da F05, "Rotas"): 201 quando nasce agora, 200 quando já
+// existia.
+export async function openDirectConversation(
+  token: string,
+  personId: string,
+): Promise<OpenDirectConversationResult> {
+  const response = await request("/v1/conversations", {
+    method: "POST",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ kind: "direct", person_id: personId }),
+  });
+  if (response?.status === 200 || response?.status === 201) {
+    const body = await jsonBody<{ conversation: ApiConversation }>(response);
+    return body
+      ? { kind: "ok", conversation: conversationFromPayload(body.conversation) }
+      : { kind: "failure" };
+  }
+  if (response?.status === 400) return { kind: "invalid" };
+  return commonFailure(response);
+}
+
+export type SaveTimeZoneResult =
+  | { kind: "ok" }
+  | { kind: "invalid" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export async function saveTimeZone(token: string, timeZone: string): Promise<SaveTimeZoneResult> {
+  const response = await request("/v1/people/me/time-zone", {
+    method: "PUT",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ time_zone: timeZone }),
+  });
+  if (response?.status === 204) return { kind: "ok" };
+  if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 401) return { kind: "unauthenticated" };
+  return { kind: "failure" };
 }
 
 export type AddMembersResult =
@@ -365,18 +705,104 @@ export async function addMembers(
 }
 
 export type MembersResult =
-  | { kind: "ok"; members: PersonSummary[] }
+  | { kind: "ok"; members: PersonEntry[] }
   | { kind: "not_found" }
   | { kind: "unauthenticated" }
   | { kind: "failure" };
 
 // Os Membros de uma Conversa, em ordem alfabética (spec da F04, "Rotas").
 export async function listMembers(token: string, conversationId: string): Promise<MembersResult> {
-  const result = await getJson<{ members: { id: string; name: string }[] }>(
+  const result = await getJson<{ members: ApiPersonEntry[] }>(
     token,
     conversationPath(conversationId, "/members"),
   );
   return result.kind === "ok"
     ? { kind: "ok", members: result.body.members.map(withInitials) }
     : result;
+}
+
+// Atividade (spec da F08, "Rotas"): o filtro da lista, o tipo de cada item e os números.
+export type ActivityFilter = "all" | "mentions" | "direct";
+export type NotificationKind = "mention" | "direct";
+
+// Um item de Atividade: a Notificação, com a Mensagem como no histórico e a Conversa dela.
+export type ActivityItem = { kind: NotificationKind; message: Message; conversation: Conversation };
+
+export type ActivityPage = { items: ActivityItem[]; hasMore: boolean };
+
+export type ActivityUnread = {
+  // A marca de "Marcar tudo como lido", ou nula.
+  activityReadMessageId: string | null;
+  totalCount: number;
+  mentionCount: number;
+  directCount: number;
+};
+
+export type ActivityPageResult =
+  | { kind: "ok"; page: ActivityPage }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+export type ActivityUnreadResult =
+  | { kind: "ok"; unread: ActivityUnread }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+type ApiActivityItem = { kind: NotificationKind; message: ApiMessage; conversation: ApiConversation };
+
+// Uma página de Atividade: as anteriores a `before`, ou as mais novas sem ele, em ordem cronológica.
+export async function listActivity(
+  token: string,
+  { kind, before }: { kind: ActivityFilter; before?: string },
+): Promise<ActivityPageResult> {
+  const params = new URLSearchParams({ kind });
+  if (before) params.set("before", before);
+  const result = await getJson<{ items: ApiActivityItem[]; has_more: boolean }>(
+    token,
+    `/v1/activity?${params.toString()}`,
+  );
+  if (result.kind !== "ok") return result.kind === "unauthenticated" ? result : { kind: "failure" };
+  return {
+    kind: "ok",
+    page: {
+      items: result.body.items.map((item) => ({
+        kind: item.kind,
+        message: messageFromEvent(item.message),
+        conversation: conversationFromPayload(item.conversation),
+      })),
+      hasMore: result.body.has_more,
+    },
+  };
+}
+
+// Os números de Atividade da Pessoa da Sessão, memorizados por requisição: o rail e a tela
+// Atividade leem os mesmos.
+export const getActivityUnread = cache(fetchActivityUnread);
+
+async function fetchActivityUnread(token: string): Promise<ActivityUnreadResult> {
+  const result = await getJson<ActivityUnreadPayload>(token, "/v1/activity/unread");
+  if (result.kind !== "ok") return result.kind === "unauthenticated" ? result : { kind: "failure" };
+  return { kind: "ok", unread: activityUnreadFromPayload(result.body) };
+}
+
+export type MarkActivityReadResult =
+  | { kind: "ok"; unread: ActivityUnread }
+  | { kind: "not_found" }
+  | { kind: "invalid" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Marca tudo como lido até a Mensagem (spec da F08, "Rotas"): só avança.
+export async function markActivityRead(token: string, messageId: string): Promise<MarkActivityReadResult> {
+  const response = await request("/v1/activity/read", {
+    method: "PUT",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ message_id: messageId }),
+  });
+  if (response?.status === 200) {
+    const body = await jsonBody<ActivityUnreadPayload>(response);
+    return body ? { kind: "ok", unread: activityUnreadFromPayload(body) } : { kind: "failure" };
+  }
+  if (response?.status === 400) return { kind: "invalid" };
+  return commonFailure(response);
 }

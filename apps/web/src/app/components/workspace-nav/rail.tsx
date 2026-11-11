@@ -1,11 +1,14 @@
-import { House } from "lucide-react";
-import Link from "next/link";
 import { UserMenu } from "@/app/components/user/user-menu";
+import { ThemeToggle } from "./theme-toggle";
 import type { Person } from "@/app/services/chat-api";
+import { Suspense } from "react";
+import { ActivityLink } from "./activity-link";
+import { ActivityNav } from "./activity-nav";
+import { HomeLink } from "./home-link";
 
 type RailProps = { person: Person };
 
-// Trilho de seções, fundo chrome. Na F01: o "FC", "Início" e o avatar de iniciais.
+// Trilho de seções, fundo chrome: o "FC", "Início", "Atividade" (F08) e o avatar de iniciais.
 export function Rail({ person }: RailProps) {
   return (
     <nav
@@ -20,17 +23,12 @@ export function Rail({ person }: RailProps) {
           FC
         </span>
       </div>
-      <Link
-        href="/"
-        aria-current="page"
-        className="flex w-full flex-col items-center gap-1 rounded-card py-1 text-sidebar-fg"
-      >
-        <span className="flex size-9 items-center justify-center rounded-card bg-sidebar-field">
-          <House size={20} aria-hidden />
-        </span>
-        <span className="text-caption font-bold">Início</span>
-      </Link>
+      <HomeLink personId={person.id} />
+      <Suspense fallback={<ActivityLink personId={person.id} initialUnread={null} />}>
+        <ActivityNav personId={person.id} />
+      </Suspense>
       <div className="flex-1" />
+      <ThemeToggle />
       <UserMenu person={person} />
     </nav>
   );

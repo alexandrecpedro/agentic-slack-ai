@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/app/services/chat-api";
-import { appendToLatestPage, flattenPages } from "./message-pages";
+import {
+  appendToLatestPage,
+  flattenPages,
+  patchQuotes,
+  recordEdit,
+  removeDeleted,
+  replaceEdited,
+} from "./message-pages";
 
 function message(id: string): Message {
   return {
@@ -10,6 +17,9 @@ function message(id: string): Message {
     author: { id: "p1", name: "Ana Souza", initials: "AS" },
     body: `Mensagem ${id}`,
     createdAt: "2026-11-09T12:00:00.000Z",
+    editedAt: null,
+    mentions: [],
+    quote: null,
   };
 }
 
@@ -92,5 +102,106 @@ describe("appendToLatestPage", () => {
     expect(appendToLatestPage([], message("1"))).toEqual([
       { messages: [message("1")], hasMore: false },
     ]);
+  });
+});
+
+describe("replaceEdited", () => {
+  const edited = (id: string, at: string, body = "Texto novo"): Message => ({
+    ...message(id),
+    body,
+    editedAt: at,
+  });
+
+  it("troca pelo id só com editedAt mais novo", () => {
+    const pages = [{ messages: [message("a"), message("b")], hasMore: false }];
+
+    const next = replaceEdited(pages, edited("b", "2026-11-09T12:05:00.000Z"));
+
+    expect(next[0].messages.map((item) => item.body)).toEqual(["Mensagem a", "Texto novo"]);
+  });
+
+  it("descarta a edição atrasada", () => {
+    const pages = [
+      { messages: [edited("a", "2026-11-09T12:05:00.000Z", "Mais nova")], hasMore: false },
+    ];
+
+    const next = replaceEdited(pages, edited("a", "2026-11-09T12:04:00.000Z", "Atrasada"));
+
+    expect(next).toBe(pages);
+  });
+
+  it("não insere Mensagem fora do cache", () => {
+    const pages = [{ messages: [message("a")], hasMore: false }];
+
+    const next = replaceEdited(pages, edited("z", "2026-11-09T12:05:00.000Z"));
+
+    expect(next).toBe(pages);
+  });
+});
+
+describe("removeDeleted", () => {
+  it("tira a Mensagem pelo id, em qualquer página", () => {
+    const pages = [
+      { messages: [message("c")], hasMore: true },
+      { messages: [message("a"), message("b")], hasMore: false },
+    ];
+
+    const next = removeDeleted(pages, "a");
+
+    expect(flattenPages(next).map((item) => item.id)).toEqual(["b", "c"]);
+  });
+
+  it("a edição depois da exclusão não traz a Mensagem de volta", () => {
+    const pages = removeDeleted([{ messages: [message("a")], hasMore: false }], "a");
+
+    const next = replaceEdited(pages, { ...message("a"), editedAt: "2026-11-09T12:05:00.000Z" });
+
+    expect(flattenPages(next)).toEqual([]);
+  });
+});
+
+describe("patchQuotes", () => {
+  const quoting = (id: string, quotedId: string, body = "Mensagem a"): Message => ({
+    ...message(id),
+    quote: {
+      id: quotedId,
+      deleted: false,
+      author: { id: "p1", name: "Ana Souza" },
+      body,
+    },
+  });
+
+  it("a edição atualiza as quote que citam a editada", () => {
+    const pages = [{ messages: [message("a"), quoting("b", "a")], hasMore: false }];
+    const edited = { ...message("a"), body: "Texto novo", editedAt: "2026-11-09T12:05:00.000Z" };
+
+    const next = patchQuotes(pages, { id: "a", edited });
+
+    expect(next[0].messages[1].quote).toMatchObject({ body: "Texto novo" });
+  });
+
+  it("a exclusão marca as quote, e a quote apagada não volta com uma edição", () => {
+    const pages = [{ messages: [quoting("b", "a")], hasMore: false }];
+
+    const deleted = patchQuotes(pages, { id: "a", deleted: true });
+    const late = patchQuotes(deleted, {
+      id: "a",
+      edited: { ...message("a"), body: "Atrasada", editedAt: "2026-11-09T12:05:00.000Z" },
+    });
+
+    expect(deleted[0].messages[0].quote).toEqual({ id: "a", deleted: true });
+    expect(late).toBe(deleted);
+  });
+});
+
+describe("recordEdit", () => {
+  it("aceita a edição mais nova e descarta a atrasada", () => {
+    const versions = new Map<string, string>();
+    const newer = { ...message("a"), editedAt: "2026-11-09T12:05:00.000Z" };
+    const older = { ...message("a"), editedAt: "2026-11-09T12:04:00.000Z" };
+
+    expect(recordEdit(versions, newer)).toBe(true);
+    expect(recordEdit(versions, older)).toBe(false);
+    expect(recordEdit(versions, newer)).toBe(false);
   });
 });

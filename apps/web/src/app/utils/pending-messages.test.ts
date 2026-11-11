@@ -10,6 +10,9 @@ function message(clientId: string, authorId = "p1"): Message {
     author: { id: authorId, name: "Ana Souza", initials: "AS" },
     body: "Olá",
     createdAt: "2026-11-09T12:00:00.000Z",
+    editedAt: null,
+    mentions: [],
+    quote: null,
   };
 }
 

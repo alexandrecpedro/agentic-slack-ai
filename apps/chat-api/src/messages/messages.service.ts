@@ -1,19 +1,37 @@
-import { TransactionHost } from '@nestjs-cls/transactional';
+import { Transactional, TransactionHost } from '@nestjs-cls/transactional';
 import { TransactionalAdapterTypeOrm } from '@nestjs-cls/transactional-adapter-typeorm';
 import { Injectable, Logger } from '@nestjs/common';
+import type { MentionPayload, QuotePayload } from 'chat-events';
 import { randomUUIDv7 } from 'node:crypto';
-import { LessThan, Repository } from 'typeorm';
+import { isUUID } from 'class-validator';
+import { In, IsNull, LessThan, Not, Repository } from 'typeorm';
+import { ConversationNotFoundError } from '../conversations/conversation-not-found.error';
 import { ConversationsService } from '../conversations/conversations.service';
+import { MembershipsService } from '../memberships/memberships.service';
+import { ActivityPublisher } from '../notifications/activity.publisher';
 import { PeopleService } from '../people/people.service';
 import { RealtimePublisher } from '../realtime/realtime.publisher';
 import { ClientIdConflictError } from './client-id-conflict.error';
 import { Message } from './message.entity';
+import { MessageMention } from './message-mention.entity';
+import { extractMentionUsernames } from './mentions';
+import { MessageNotFoundError } from './message-not-found.error';
+import { MessageNotOwnedError } from './message-not-owned.error';
+import { QuotedMessageNotFoundError } from './quoted-message-not-found.error';
+import { UnreadPublisher } from './unread.publisher';
+import { KeyedSerialQueue } from '../common/queue/keyed-serial-queue';
 import { toMessageResponse } from './message.response';
 
 export interface MessageAuthor {
   id: string;
   name: string;
 }
+
+// Uma Pessoa mencionada (spec da F06, "A Mensagem no REST e nos eventos").
+export type MentionView = MentionPayload;
+
+// A Mensagem citada (spec da F06, "A Mensagem no REST e nos eventos").
+export type QuoteView = QuotePayload;
 
 export interface MessageView {
   id: string;
@@ -22,6 +40,9 @@ export interface MessageView {
   author: MessageAuthor;
   body: string;
   createdAt: Date;
+  editedAt: Date | null;
+  mentions: MentionView[];
+  quote: QuoteView | null;
 }
 
 export interface MessagePage {
@@ -37,12 +58,24 @@ export interface PageRequest {
 export interface NewMessage {
   clientId: string;
   body: string;
+  quotedMessageId?: string;
 }
 
 export interface SentMessage {
   message: MessageView;
   // Falso quando o client_id já tinha sido gravado: o reenvio não gera evento.
   created: boolean;
+  // A Pessoa que virou Membro da Conversa direta com esta Mensagem (a primeira), ou null.
+  joinedId: string | null;
+}
+
+interface PublicationSlot {
+  fill: (publish: (() => Promise<void>) | null) => void;
+}
+
+interface Barrier {
+  done: Promise<void>;
+  release: () => void;
 }
 
 @Injectable()
@@ -54,10 +87,17 @@ export class MessagesService {
     private readonly conversations: ConversationsService,
     private readonly people: PeopleService,
     private readonly publisher: RealtimePublisher,
+    private readonly unreadPublisher: UnreadPublisher,
+    private readonly memberships: MembershipsService,
+    private readonly activityPublisher: ActivityPublisher,
   ) {}
 
   private get messages(): Repository<Message> {
     return this.txHost.tx.getRepository(Message);
+  }
+
+  private get mentions(): Repository<MessageMention> {
+    return this.txHost.tx.getRepository(MessageMention);
   }
 
   // Uma página do histórico, em ordem cronológica: as `limit` Mensagens anteriores a `before`, ou
@@ -71,6 +111,8 @@ export class MessagesService {
     const newestFirst = await this.messages.find({
       where: {
         conversationId,
+        // A Mensagem apagada sai da Conversa (spec da F06, "Histórico").
+        deletedAt: IsNull(),
         ...(before ? { id: LessThan(before) } : {}),
       },
       order: { id: 'DESC' },
@@ -78,7 +120,19 @@ export class MessagesService {
     });
     const hasMore = newestFirst.length > limit;
     const page = newestFirst.slice(0, limit).reverse();
-    return { messages: await this.withAuthors(page), hasMore };
+    return { messages: await this.withDetails(page), hasMore };
+  }
+
+  // As Mensagens vivas desses ids, montadas como no histórico (autor, Menções e Citação), sem ordem
+  // garantida; a que foi apagada ou não existe fica fora. É a Mensagem dos itens de Atividade (spec
+  // da F08, "Notificações e contagem", "Versão por Pessoa").
+  async viewsByIds(ids: string[]): Promise<MessageView[]> {
+    if (ids.length === 0) return [];
+    const found = await this.messages.findBy({
+      id: In(ids),
+      deletedAt: IsNull(),
+    });
+    return this.withDetails(found);
   }
 
   // Envia a Mensagem: grava e, só quando a gravação é nova, publica o evento para os Membros, depois
@@ -90,37 +144,374 @@ export class MessagesService {
     conversationId: string,
     newMessage: NewMessage,
   ): Promise<MessageView> {
-    const { message, created } = await this.send(
-      author,
-      conversationId,
-      newMessage,
-    );
-    if (created) {
-      try {
+    // A barreira desta Mensagem, se ela for a que põe a outra Pessoa na Conversa direta: montada
+    // dentro da transação (em `send`), antes do commit, e liberada depois da publicação.
+    let barrier: Barrier | null = null;
+    let sent: SentMessage;
+    try {
+      sent = await this.send(author, conversationId, newMessage, (created) => {
+        barrier = created;
+      });
+    } catch (error) {
+      (barrier as Barrier | null)?.release();
+      throw error;
+    }
+    const { message, created, joinedId } = sent;
+    const own = barrier as Barrier | null;
+    if (!created) return message;
+    // Uma Mensagem que não abre a Conversa direta espera a barreira que estiver montada nela, para
+    // a entrada da outra Pessoa chegar antes de qualquer Mensagem (spec da F05, "Tempo real",
+    // "Ordem"). Sem barreira, a publicação sai na hora, sem prender a resposta do envio.
+    const waitFor = own
+      ? Promise.resolve()
+      : this.barriers.get(conversationId)?.done;
+    const publication = (waitFor ?? Promise.resolve())
+      .then(async () => {
         const memberIds =
           await this.conversations.listMemberIds(conversationId);
-        // A gravação no Redis e a emissão não prendem a resposta do envio.
-        void this.publisher
-          .messageCreated(memberIds, toMessageResponse(message))
-          .catch((error: unknown) =>
-            this.logger.error('Falha ao publicar a Mensagem gravada', error),
-          );
-      } catch (error) {
-        this.logger.error('Falha ao publicar a Mensagem gravada', error);
-      }
-    }
+        if (joinedId) {
+          // Uma falha aqui fica no log e não segura a Mensagem.
+          await this.memberships
+            .announceDirectJoin(conversationId, memberIds, joinedId)
+            .catch((error: unknown) =>
+              this.logger.error(
+                'Falha ao publicar a participação gravada',
+                error,
+              ),
+            );
+        }
+        await this.publisher.messageCreated(
+          memberIds,
+          toMessageResponse(message),
+        );
+        // Os números de todos os Membros, depois da Mensagem (spec da F07, "Tempo real"). Têm fila
+        // própria, por Conversa: a fila da Mensagem não espera por eles.
+        const unread = this.unreadPublisher.publish(conversationId, memberIds);
+        // Os números de Atividade (spec da F08, "Tempo real"): numa Conversa direta, as duas
+        // Pessoas; num Canal, o autor, que leu até aqui, e as Pessoas mencionadas.
+        this.activityPublisher.publish(
+          async () =>
+            (await this.conversations.isDirect(conversationId))
+              ? memberIds
+              : [author.id, ...message.mentions.map((mention) => mention.id)],
+          unread,
+        );
+      })
+      .catch((error: unknown) =>
+        this.logger.error('Falha ao publicar a Mensagem gravada', error),
+      )
+      .finally(() => own?.release());
+    // A edição e a exclusão desta Mensagem só publicam depois da criação (spec da F06, "Tempo
+    // real", "Ordem"): a fila dela nasce aqui, antes de o envio responder.
+    this.queueForMessage(message.id, () => publication);
     return message;
+  }
+
+  // As publicações pendentes de cada Mensagem, em fila: a criação, as edições e a exclusão saem na
+  // ordem em que foram gravadas, mesmo publicando depois do commit. A API roda numa instância só.
+  private readonly messageQueues = new KeyedSerialQueue();
+
+  private queueForMessage(messageId: string, publish: () => Promise<void>) {
+    void this.messageQueues.run(messageId, publish);
+  }
+
+  // Reserva o lugar da publicação na fila da Mensagem ainda com a trava de linha, antes do commit:
+  // a ordem da fila é a dos commits, mesmo que a continuação de uma transação demore mais que a
+  // seguinte. Depois do commit, o lugar recebe a publicação, ou nada (falha ou sem mudança).
+  private reservePublication(messageId: string): PublicationSlot {
+    let fill!: (publish: (() => Promise<void>) | null) => void;
+    const ready = new Promise<(() => Promise<void>) | null>((resolve) => {
+      fill = resolve;
+    });
+    this.queueForMessage(messageId, () => ready.then((publish) => publish?.()));
+    return { fill };
+  }
+
+  // Grava numa transação que reserva o lugar da publicação e, depois do commit, enche esse lugar.
+  private async withPublication<T>(
+    run: (reserve: (messageId: string) => void) => Promise<T>,
+    publishFor: (result: T) => (() => Promise<void>) | null,
+  ): Promise<T> {
+    let slot: PublicationSlot | null = null;
+    let result: T;
+    try {
+      result = await run((messageId) => {
+        slot = this.reservePublication(messageId);
+      });
+    } catch (error) {
+      (slot as PublicationSlot | null)?.fill(null);
+      throw error;
+    }
+    (slot as PublicationSlot | null)?.fill(publishFor(result));
+    return result;
+  }
+
+  // Edita a própria Mensagem (spec da F06, "Editar"): grava numa transação e, só quando o texto
+  // mudou, publica o message.updated para os Membros depois do commit. Como no envio, a falha da
+  // publicação só vai para o log.
+  async editMessage(
+    author: MessageAuthor,
+    conversationId: string,
+    messageId: string,
+    body: string,
+  ): Promise<MessageView> {
+    const { message } = await this.withPublication(
+      (reserve) => this.edit(author, conversationId, messageId, body, reserve),
+      ({ message: edited, changed, mentionChangedIds }) =>
+        changed
+          ? this.toMembers(
+              conversationId,
+              async (memberIds) => {
+                await this.publisher.messageUpdated(
+                  memberIds,
+                  toMessageResponse(edited),
+                );
+                // Só quem entrou ou saiu das Menções e ainda não tinha lido a Mensagem tem os
+                // números mudados (spec da F07).
+                if (mentionChangedIds.length > 0) {
+                  const changed = new Set(mentionChangedIds);
+                  // Lida uma vez só, para os dois publicadores.
+                  const affected = this.conversations
+                    .listMemberIdsReadBefore(
+                      conversationId,
+                      messageId,
+                      author.id,
+                    )
+                    .then((ids) => ids.filter((id) => changed.has(id)));
+                  affected.catch(() => {});
+                  const unread = this.unreadPublisher.publish(
+                    conversationId,
+                    () => affected,
+                  );
+                  // As Notificações das mesmas Pessoas (spec da F08).
+                  this.activityPublisher.publish(() => affected, unread);
+                }
+              },
+              'Falha ao publicar a Mensagem editada',
+            )
+          : null,
+    );
+    return message;
+  }
+
+  // Apaga a própria Mensagem (spec da F06, "Apagar"): zera o texto e grava `deleted_at` numa
+  // transação, e publica o message.deleted para os Membros depois do commit.
+  async deleteMessage(
+    personId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<void> {
+    await this.withPublication(
+      (reserve) => this.remove(personId, conversationId, messageId, reserve),
+      () =>
+        this.toMembers(
+          conversationId,
+          async (memberIds) => {
+            await this.publisher.messageDeleted(memberIds, {
+              conversation_id: conversationId,
+              message_id: messageId,
+            });
+            // Só quem ainda não tinha lido a Mensagem tem os números mudados (spec da F07).
+            // Lida uma vez só, para os dois publicadores.
+            let unreadIds: Promise<string[]> | undefined;
+            const readBefore = () =>
+              (unreadIds ??= this.conversations.listMemberIdsReadBefore(
+                conversationId,
+                messageId,
+                personId,
+              ));
+            const unread = this.unreadPublisher.publish(
+              conversationId,
+              readBefore,
+            );
+            // Dessas Pessoas, as que tinham a Mensagem como Notificação (spec da F08): a outra
+            // Pessoa da Conversa direta, ou as mencionadas num Canal. As Menções ficam na exclusão.
+            this.activityPublisher.publish(async () => {
+              const [stillUnread, isDirect, mentions] = await Promise.all([
+                readBefore(),
+                this.conversations.isDirect(conversationId),
+                this.mentionsOf(messageId),
+              ]);
+              if (isDirect) return stillUnread;
+              const mentioned = new Set(mentions.map((mention) => mention.id));
+              return stillUnread.filter((id) => mentioned.has(id));
+            }, unread);
+          },
+          'Falha ao publicar a Mensagem apagada',
+        ),
+    );
+  }
+
+  // Com a mesma trava de linha da edição. As Menções, quando existirem, ficam (spec da F06).
+  @Transactional()
+  private async remove(
+    personId: string,
+    conversationId: string,
+    messageId: string,
+    reserve: (messageId: string) => void,
+  ): Promise<void> {
+    const message = await this.lockOwnMessage(
+      personId,
+      conversationId,
+      messageId,
+    );
+    reserve(message.id);
+    await this.messages.update(
+      { id: message.id },
+      { body: null, deletedAt: new Date() },
+    );
+  }
+
+  // A publicação de um evento para os Membros da Conversa, que a fila da Mensagem roda depois do
+  // commit, sem prender a resposta: a gravação já valeu, e a falha só vai para o log (LLD,
+  // "Transações").
+  private toMembers(
+    conversationId: string,
+    publish: (memberIds: string[]) => Promise<void>,
+    failureLog: string,
+  ): () => Promise<void> {
+    return () =>
+      this.conversations
+        .listMemberIds(conversationId)
+        .then(publish)
+        .catch((error: unknown) => this.logger.error(failureLog, error));
+  }
+
+  // A trava de linha põe a edição e a exclusão da mesma Mensagem em fila (LLD, "Concorrência e
+  // idempotência", "Editar e apagar mensagem"): a que chega depois lê a linha já gravada.
+  @Transactional()
+  private async edit(
+    author: MessageAuthor,
+    conversationId: string,
+    messageId: string,
+    body: string,
+    reserve: (messageId: string) => void,
+  ): Promise<{
+    message: MessageView;
+    changed: boolean;
+    mentionChangedIds: string[];
+  }> {
+    const message = await this.lockOwnMessage(
+      author.id,
+      conversationId,
+      messageId,
+    );
+    reserve(message.id);
+    const previousBody = message.body ?? '';
+    const changed = previousBody !== body;
+    if (changed) {
+      message.body = body;
+      // Estritamente crescente por Mensagem, mesmo com duas edições no mesmo milissegundo: a aba só
+      // aceita uma edição com edited_at mais novo (spec da F06, "Eventos no cliente").
+      message.editedAt = new Date(
+        Math.max(Date.now(), (message.editedAt?.getTime() ?? 0) + 1),
+      );
+      await this.messages.update(
+        { id: message.id },
+        { body, editedAt: message.editedAt },
+      );
+    }
+    // Só regrava as Menções quando os @usuário escritos mudaram, e não a cada correção do texto.
+    const previousMentions = await this.mentionsOf(message.id);
+    const rewritesMentions = changed && !sameUsernames(previousBody, body);
+    const mentions = rewritesMentions
+      ? await this.saveMentions(message, body, true)
+      : previousMentions;
+    // O autor é quem pediu: o nome vem da Sessão, sem outra consulta.
+    return {
+      message: toView(message, author, mentions, await this.quoteOf(message)),
+      changed,
+      mentionChangedIds: rewritesMentions
+        ? symmetricDifference(
+            previousMentions.map((mention) => mention.id),
+            mentions.map((mention) => mention.id),
+          )
+        : [],
+    };
+  }
+
+  // A Mensagem do autor, lida com trava de linha. A Conversa sem participação, ou com id
+  // malformado, e a Mensagem que não existe ou é de outra Conversa respondem do mesmo jeito, para
+  // não revelar qual dos casos; a de outra Pessoa, que o Membro já vê, responde que não é dele.
+  private async lockOwnMessage(
+    personId: string,
+    conversationId: string,
+    messageId: string,
+  ): Promise<Message> {
+    try {
+      await this.conversations.getForMember(personId, conversationId);
+      // Em série com a remoção de Membro, que trava a Conversa (FOR UPDATE): a participação é
+      // conferida de novo sob a trava, e quem foi removido enquanto esperava não muda nada.
+      await this.txHost.tx.query(
+        'SELECT 1 FROM conversations WHERE id = $1 FOR SHARE',
+        [conversationId],
+      );
+      await this.conversations.getForMember(personId, conversationId);
+    } catch (error) {
+      if (error instanceof ConversationNotFoundError) {
+        throw new MessageNotFoundError();
+      }
+      throw error;
+    }
+    if (!isUUID(messageId)) throw new MessageNotFoundError();
+    const message = await this.messages
+      .createQueryBuilder('message')
+      .setLock('pessimistic_write')
+      .where('message.id = :messageId', { messageId })
+      .andWhere('message.conversationId = :conversationId', { conversationId })
+      .getOne();
+    // A apagada responde como a que não existe: editar ou apagar de novo dá 404.
+    if (!message || message.deletedAt) throw new MessageNotFoundError();
+    if (message.authorId !== personId) throw new MessageNotOwnedError();
+    return message;
+  }
+
+  // As barreiras das Conversas diretas cuja outra Pessoa acabou de entrar e ainda não foi anunciada.
+  // A API roda numa instância só.
+  private readonly barriers = new Map<string, Barrier>();
+
+  private raiseBarrier(conversationId: string): Barrier {
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const barrier: Barrier = {
+      done,
+      release: () => {
+        release();
+        if (this.barriers.get(conversationId) === barrier) {
+          this.barriers.delete(conversationId);
+        }
+      },
+    };
+    this.barriers.set(conversationId, barrier);
+    return barrier;
   }
 
   // Envio sem duplicar (LLD, "Concorrência e idempotência"): o mesmo `client_id` do mesmo autor
   // devolve a Mensagem já gravada, sem gravar outra; o texto do reenvio é ignorado. O conflito é
   // resolvido pela unicidade do banco, o que vale também para dois envios ao mesmo tempo.
+  // Uma transação: a Mensagem e a participação da outra Pessoa da Conversa direta, na primeira
+  // Mensagem, gravam juntas (spec da F05, "Conversa direta", "Primeira Mensagem").
+  @Transactional()
   private async send(
     author: MessageAuthor,
     conversationId: string,
-    { clientId, body }: NewMessage,
+    { clientId, body, quotedMessageId }: NewMessage,
+    onBarrier: (barrier: Barrier) => void,
   ): Promise<SentMessage> {
-    await this.conversations.getForMember(author.id, conversationId);
+    const conversation = await this.conversations.getForMember(
+      author.id,
+      conversationId,
+    );
+    // O reenvio do mesmo client_id devolve a Mensagem já gravada, sem olhar a Citação nova (spec da
+    // F06, "Enviar com Citação"); só o envio novo confere a Citação.
+    if (
+      quotedMessageId !== undefined &&
+      !(await this.messages.existsBy({ authorId: author.id, clientId }))
+    ) {
+      await this.assertQuotable(conversationId, quotedMessageId);
+    }
     const inserted = await this.messages
       .createQueryBuilder()
       .insert()
@@ -130,6 +521,7 @@ export class MessagesService {
         authorId: author.id,
         clientId,
         body,
+        quotedMessageId: quotedMessageId ?? null,
       })
       .orIgnore()
       .returning(['id', 'created_at'])
@@ -143,6 +535,7 @@ export class MessagesService {
           authorId: author.id,
           clientId,
           body,
+          quotedMessageId: quotedMessageId ?? null,
           createdAt: row.created_at,
         })
       : await this.messages.findOneByOrFail({ authorId: author.id, clientId });
@@ -150,31 +543,217 @@ export class MessagesService {
     if (message.conversationId !== conversationId) {
       throw new ClientIdConflictError();
     }
-    return { message: toView(message, author), created: Boolean(row) };
+    const joinedId = row
+      ? await this.conversations.joinDirectCounterpart(conversation, author.id)
+      : null;
+    // Antes do commit: outro envio na mesma Conversa espera esta participação no índice único e,
+    // quando passa, já encontra a barreira.
+    if (joinedId) onBarrier(this.raiseBarrier(conversationId));
+    // Quem escreve leu a Conversa até a própria Mensagem (spec da F07, "Avançar a Última
+    // leitura"); o reenvio não muda nada.
+    if (row) {
+      await this.conversations.advanceLastRead(
+        conversationId,
+        author.id,
+        message.id,
+      );
+    }
+    // Depois da participação da outra Pessoa da Conversa direta: ela já pode ser mencionada.
+    const mentions = row
+      ? await this.saveMentions(message, body, false)
+      : await this.mentionsOf(message.id);
+    return {
+      message: toView(message, author, mentions, await this.quoteOf(message)),
+      created: Boolean(row),
+      joinedId,
+    };
   }
 
-  // Os nomes dos autores vêm do PeopleService, numa consulta pelos ids da página.
-  private async withAuthors(messages: Message[]): Promise<MessageView[]> {
-    const authorIds = [...new Set(messages.map((message) => message.authorId))];
+  // As Menções da Mensagem pelo texto gravado (spec da F06, "Menções, ao gravar"): os @usuário de
+  // Membros da Conversa, numa consulta só. Na edição, grava só a diferença.
+  private async saveMentions(
+    message: Message,
+    body: string,
+    replace: boolean,
+  ): Promise<MentionView[]> {
+    const usernames = extractMentionUsernames(body);
+    const mentioned = await this.conversations.findMembersByUsernames(
+      message.conversationId,
+      usernames,
+    );
+    const ids = mentioned.map((person) => person.id);
+    if (replace) {
+      await this.mentions.delete({
+        messageId: message.id,
+        ...(ids.length > 0 ? { personId: Not(In(ids)) } : {}),
+      });
+    }
+    if (ids.length > 0) {
+      await this.mentions
+        .createQueryBuilder()
+        .insert()
+        .values(
+          ids.map((personId) => ({
+            id: randomUUIDv7(),
+            messageId: message.id,
+            personId,
+          })),
+        )
+        .orIgnore()
+        .execute();
+    }
+    return sortMentions(mentioned);
+  }
+
+  private async mentionsOf(messageId: string): Promise<MentionView[]> {
+    return (await this.mentionsByMessage([messageId])).get(messageId) ?? [];
+  }
+
+  // As Menções de várias Mensagens, numa consulta pelos ids.
+  private async mentionsByMessage(
+    messageIds: string[],
+  ): Promise<Map<string, MentionView[]>> {
+    const byMessage = new Map<string, MentionView[]>();
+    if (messageIds.length === 0) return byMessage;
+    const rows = await this.txHost.tx.query<
+      { message_id: string; id: string; username: string }[]
+    >(
+      `SELECT mm.message_id, p.id, p.username FROM message_mentions mm
+         JOIN people p ON p.id = mm.person_id
+        WHERE mm.message_id = ANY($1)`,
+      [messageIds],
+    );
+    for (const row of rows) {
+      const list = byMessage.get(row.message_id) ?? [];
+      list.push({ id: row.id, username: row.username });
+      byMessage.set(row.message_id, list);
+    }
+    for (const [id, list] of byMessage) byMessage.set(id, sortMentions(list));
+    return byMessage;
+  }
+
+  // A Citação precisa ser de uma Mensagem viva da mesma Conversa. A linha da original fica travada
+  // em modo compartilhado até o commit, em série com a exclusão (que a trava para escrita): uma
+  // exclusão não grava no meio deste envio.
+  private async assertQuotable(
+    conversationId: string,
+    quotedMessageId: string,
+  ): Promise<void> {
+    const quoted = await this.messages
+      .createQueryBuilder('message')
+      .setLock('pessimistic_read')
+      .where('message.id = :quotedMessageId', { quotedMessageId })
+      .andWhere('message.conversationId = :conversationId', { conversationId })
+      .getOne();
+    if (!quoted || quoted.deletedAt) throw new QuotedMessageNotFoundError();
+  }
+
+  private async quoteOf(message: Message): Promise<QuoteView | null> {
+    if (!message.quotedMessageId) return null;
+    return (await this.quotesById([message.quotedMessageId])).get(
+      message.quotedMessageId,
+    )!;
+  }
+
+  // As Mensagens citadas, com o autor e o texto atual, ou só a marca de apagada, numa consulta para
+  // as Mensagens e outra para os autores.
+  private async quotesById(ids: string[]): Promise<Map<string, QuoteView>> {
+    const quotes = new Map<string, QuoteView>();
+    if (ids.length === 0) return quotes;
+    const quoted = await this.messages.findBy({ id: In(ids) });
     const authors = new Map(
-      (await this.people.findByIds(authorIds)).map((person) => [
-        person.id,
-        { id: person.id, name: person.name },
-      ]),
+      (
+        await this.people.findByIds([
+          ...new Set(quoted.map((message) => message.authorId)),
+        ])
+      ).map((person) => [person.id, { id: person.id, name: person.name }]),
+    );
+    for (const message of quoted) {
+      quotes.set(
+        message.id,
+        message.deletedAt
+          ? { id: message.id, deleted: true }
+          : {
+              id: message.id,
+              deleted: false,
+              author: authors.get(message.authorId)!,
+              body: message.body ?? '',
+            },
+      );
+    }
+    return quotes;
+  }
+
+  // Os autores, as Menções e as Citações de uma página, numa consulta para cada.
+  private async withDetails(messages: Message[]): Promise<MessageView[]> {
+    const authorIds = [...new Set(messages.map((message) => message.authorId))];
+    const quotedIds = [
+      ...new Set(
+        messages.flatMap((message) =>
+          message.quotedMessageId ? [message.quotedMessageId] : [],
+        ),
+      ),
+    ];
+    const [people, mentions, quotes] = await Promise.all([
+      this.people.findByIds(authorIds),
+      this.mentionsByMessage(messages.map((message) => message.id)),
+      this.quotesById(quotedIds),
+    ]);
+    const authors = new Map(
+      people.map((person) => [person.id, { id: person.id, name: person.name }]),
     );
     return messages.map((message) =>
-      toView(message, authors.get(message.authorId)!),
+      toView(
+        message,
+        authors.get(message.authorId)!,
+        mentions.get(message.id) ?? [],
+        message.quotedMessageId
+          ? (quotes.get(message.quotedMessageId) ?? null)
+          : null,
+      ),
     );
   }
 }
 
-function toView(message: Message, author: MessageAuthor): MessageView {
+function sameUsernames(before: string, after: string): boolean {
+  const previous = extractMentionUsernames(before).sort();
+  const next = extractMentionUsernames(after).sort();
+  return (
+    previous.length === next.length &&
+    previous.every((username, index) => username === next[index])
+  );
+}
+
+// Em ordem de @usuário, para a resposta não depender da ordem do banco.
+function sortMentions(mentions: MentionView[]): MentionView[] {
+  return mentions.toSorted((a, b) => a.username.localeCompare(b.username));
+}
+
+function toView(
+  message: Message,
+  author: MessageAuthor,
+  mentions: MentionView[],
+  quote: QuoteView | null,
+): MessageView {
   return {
     id: message.id,
     conversationId: message.conversationId,
     clientId: message.clientId,
     author,
-    body: message.body,
+    // As rotas só devolvem Mensagens vivas, com texto (spec da F06, "Histórico").
+    body: message.body ?? '',
     createdAt: message.createdAt,
+    editedAt: message.editedAt ?? null,
+    mentions,
+    quote,
   };
+}
+
+// Os ids que estão em só uma das listas: quem entrou ou saiu das Menções.
+function symmetricDifference(before: string[], after: string[]): string[] {
+  const [a, b] = [new Set(before), new Set(after)];
+  return [
+    ...[...a].filter((id) => !b.has(id)),
+    ...[...b].filter((id) => !a.has(id)),
+  ];
 }

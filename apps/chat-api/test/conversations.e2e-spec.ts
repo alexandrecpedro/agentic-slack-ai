@@ -62,7 +62,9 @@ describe('conversas', () => {
         `árvore-${suffix}`,
         `zebra-${suffix}`,
       ]);
-    });
+      // Cinco Canais públicos com o workspace inteiro do banco de testes, que cresce a cada
+      // execução: com as suítes em paralelo, passa dos 5 s padrão.
+    }, 30_000);
 
     it('cada Conversa traz a quantidade de Membros', async () => {
       const { cookie } = await loggedIn();
@@ -111,6 +113,10 @@ describe('conversas', () => {
           name: channel.name,
           topic: 'Conversas do time',
           member_count: expect.any(Number) as number,
+          counterpart: null,
+          last_read_message_id: null,
+          unread_count: 0,
+          mention_count: 0,
         },
       });
     });

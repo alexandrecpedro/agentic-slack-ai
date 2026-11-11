@@ -237,8 +237,8 @@ F01-T04 (`falha-no-envio.md`).
 **File:** `e2e/sair/sair-pelo-teclado.spec.ts`
 
 **Steps:**
-  1. Do link "Início", Tab até o avatar
-  2. Enter abre o menu; seta para baixo foca "Sair do Full Cycle"; Enter
+  1. Do link "Início", Tab até o avatar, passando por "Atividade" e pelo botão de tema
+  2. Enter abre o menu; End foca "Sair do Full Cycle", o último item; Enter
     - expect: a URL é `/entrar`, o cookie de sessão não existe e a Sessão foi apagada no banco
 
 #### 7.3. sair-com-a-api-recusando

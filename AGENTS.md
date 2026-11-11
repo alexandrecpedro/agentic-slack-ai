@@ -1,44 +1,46 @@
 # AGENTS.md
 
-## Documents
+## Documentos
 
-Under `docs/` reside the documents that define the product, architecture, and implementation details. Below are the key project documents:
+Em `docs/` estão os documentos que definem o produto, a arquitetura e os detalhes de implementação. Abaixo estão os principais do projeto:
 
-1. `docs/product-brief.md`: what and for whom. MVP scope, what is left out, plans, and metrics.
-2. `docs/hld.md`: High-level design, the high-level architecture document. This is where architecture decisions, main flows, and the system overview live.
-3. `docs/lld.md`: Low-level design, the low-level architecture document. This is where implementation details live.
-4. `docs/design-system.md`: interface visual language. This is where color tokens, typography, spacing, radius and shadow, interaction states, components, responsive behavior, and the workflow with Figma live.
-5. `docs/roadmap.md`: the features to be developed, dependencies between them, and the status of each.
-6. `GLOSSARY.md`, at the root: the product domain vocabulary. Use these terms in documents and planning.
+1. `docs/product-brief.md`: o quê e para quem. Escopo do MVP, o que fica fora, planos e métricas.
+2. `docs/hld.md`: High-level design, documento de arquitetura de alto nível. Aqui ficam as decisões de arquitetura, os fluxos principais e a visão geral do sistema.
+3. `docs/lld.md`: Low-level design, documento de arquitetura de baixo nível. Aqui ficam os detalhes de implementação.
+4. `docs/design-system.md`: linguagem visual da interface. Aqui ficam os tokens de cor, tipografia, espaçamento, raio e sombra, os estados de interação, os componentes, o comportamento responsivo e o fluxo de trabalho com o Figma.
+5. `docs/roadmap.md`: as funcionalidades a desenvolver, as dependências entre elas e o status de cada uma.
+6. `GLOSSARY.md`, na raiz: o vocabulário do domínio do produto. Use esses termos nos documentos e no planejamento.
 
-Each project has its own `AGENTS.md`, containing its commands, stack peculiarities, and code practices:
+Cada projeto tem o próprio `AGENTS.md`, com os comandos, as particularidades da stack e as práticas de código dele:
 
-* `apps/chat-api/AGENTS.md`: NestJS API.
-* `apps/web/AGENTS.md`: Next.js frontend.
+- `apps/chat-api/AGENTS.md`: API em NestJS.
+- `apps/web/AGENTS.md`: frontend em Next.js.
 
-**Where each piece of information lives**
+**Onde cada informação mora**
 
-* **What the system does** lives in `docs/`: scope, architecture, schema, contract, business rules, and configuration.
-* **Never in both.** A piece of information has only one owner, and the other file points to it by document and section name, without repeating content.
-* **HLD and LLD change via their skill.** When a task changes something recorded in `docs/hld.md` or `docs/lld.md`, load the `hld` or `lld` skill and use update mode before editing the file.
-* **Information that should belong in memory files** such as AGENTS.md and rules must not be repeated in architecture documents. Create pointers from these files to the corresponding memory files.
+- **O que o sistema faz** fica em `docs/`: escopo, arquitetura, esquema, contrato, regras de negócio e configuração.
+- **Nunca nos dois.** Uma informação tem um dono só, e o outro arquivo aponta para ele pelo nome do documento e da seção, sem repetir o conteúdo.
+- **HLD e LLD mudam pela skill deles.** Quando uma tarefa muda algo que o `docs/hld.md` ou o `docs/lld.md` registra, carregue a skill `hld` ou `lld` e use o modo atualizar antes de editar o arquivo.
+- **Informações que deveriam estar nos arquivos de memória** como AGENTS.md e rules, não devem ser repetidas nos documentos de arquitetura. Faça ponteiros destes arquivos para os arquivos de memória correspondentes.
 
-## Docker Execution
+## Execução no Docker
 
-Everything runs inside Docker Compose containers: dependency installation, development server, tests, lint, TypeScript compilation, and any other project command. **Never run `pnpm`, `node`, or `npx` directly on the host machine.**
+Tudo roda dentro dos contêineres do Docker Compose: instalação de dependências, servidor de desenvolvimento, testes, lint, compilação do TypeScript e qualquer outro comando do projeto. **Nunca rode `pnpm`, `node` ou `npx` direto na máquina.**
 
-The development environment uses `compose.yaml` at the root with four services:
+O ambiente de desenvolvimento usa o `compose.yaml`, na raiz, com cinco serviços e um sexto, `e2e`, que só sobe pelo `profile`:
 
-| Service      | What it is                                                        | Host Address                     | Container-to-Container Address |
-| ------------ | ----------------------------------------------------------------- | -------------------------------- | ------------------------------ |
-| `web`      | Next.js Frontend                                                  | `http://localhost:3000`        | `http://web:3000`            |
-| `chat-api` | NestJS API, REST and WebSocket                                    | `http://localhost:3001`        | `http://chat-api:3000`       |
-| `postgres` | PostgreSQL, with `chat`, `agents`, and `business` databases | `localhost:5432`               | `postgres:5432`              |
-| `s3`       | S3 Emulator (`seaweedfs`)                                       | `http://http://localhost:8333` | `http://s3:8333`             |
+| Serviço | O que é | Endereço na máquina | Endereço entre contêineres |
+| --- | --- | --- | --- |
+| `web` | Frontend em Next.js | `http://localhost:3000` | `http://web:3000` |
+| `chat-api` | API em NestJS, REST e WebSocket | `http://localhost:3001` | `http://chat-api:3000` |
+| `postgres` | PostgreSQL, com os bancos `chat`, `agents` e `business` | `localhost:5432` | `postgres:5432` |
+| `s3` | Emulador do S3 (`seaweedfs`) | `http://localhost:8333` | `http://s3:8333` |
+| `redis` | Redis, com os eventos por Pessoa da reconexão do WebSocket | `localhost:6379` | `redis:6379` |
+| `e2e` | Playwright: testes de ponta a ponta do `web` e `playwright-cli` | — | — |
 
-The `web` and `chat-api` containers install dependencies upon startup and then stay idle without launching the application. Commands run in them via `docker compose -f compose.yaml exec <service> <command>` and each project's commands are listed in its own `AGENTS.md`.
+Os contêineres `web` e `chat-api` instalam as dependências ao subir e depois ficam parados, sem iniciar a aplicação. Os comandos rodam neles com `docker compose -f compose.yaml exec <serviço> <comando>` e os de cada projeto estão no `AGENTS.md` dele.
 
-### Starting and Stopping
+### Subir e derrubar
 
 ```bash
 docker compose -f compose.yaml up -d --build --wait
@@ -46,93 +48,105 @@ docker compose -f compose.yaml exec web pnpm dev --hostname 0.0.0.0
 docker compose -f compose.yaml exec chat-api pnpm start:dev
 ```
 
-The `--wait` flag pauses the first command until `postgres` and `s3` are ready. Dependency installation continues inside `web` and `chat-api` after that, and on the first startup, it takes a few minutes: follow along with `docker compose -f compose.yaml logs -f <service>` before running the other two. Migrations do not run automatically on startup. The other two commands block the terminal, so run each in the background. The `--hostname 0.0.0.0` flag is required so that the web service accepts connections from outside the container.
+O `--wait` segura o primeiro comando só até o `postgres`, o `s3` e o `redis` ficarem prontos. A instalação das dependências continua dentro de `web` e `chat-api` depois disso e, na primeira subida, leva alguns minutos: acompanhe com `docker compose -f compose.yaml logs -f <serviço>` antes de rodar os outros dois. As migrações não rodam na subida. Os outros dois ficam presos ao terminal, então rode cada um em segundo plano. O `--hostname 0.0.0.0` é necessário para que a web aceite conexões de fora do contêiner.
 
-**Stopping**
+**Testes de ponta a ponta.** O serviço `e2e` sobe à parte, com o ambiente acima já de pé (web, API do chat e banco). Ele não roda os testes sozinho: o processo dele só encaminha `localhost:3000` para a web e `localhost:3001` para a API do chat, para o navegador do teste usar os mesmos endereços que o da máquina e o cookie de sessão valer no WebSocket (`docs/lld.md`, "Ambiente de desenvolvimento"). Por isso, no `e2e`, a web é `localhost`, e não o nome do serviço, uma exceção à regra de "Rede entre serviços":
+
+```bash
+docker compose -f compose.yaml --profile e2e up -d e2e
+```
+
+Os comandos que rodam nele estão no `apps/web/AGENTS.md`. Para derrubá-lo junto com o resto, use `docker compose -f compose.yaml --profile e2e down`; sem o `--profile`, o `down` deixa o `e2e` de pé.
+
+**Derrubar**
 
 ```bash
 docker compose -f compose.yaml down
 ```
 
-**Rare Procedures**
+**Procedimentos raros**
 
-**Starting from scratch.** To erase data and recreate the database:
+**Recomeçar do zero.** Para apagar os dados e recriar o banco:
 
 ```bash
 docker compose -f compose.yaml down -v
 ```
 
-The `-v` flag deletes database and storage volumes: on the next startup, the script in `docker/postgres/init/` recreates databases and roles without tables. Then, start the environment as described in "Starting and Stopping".
+O `-v` apaga os volumes do banco e do armazenamento: na próxima subida, o script de `docker/postgres/init/` recria os bancos e os papéis, sem tabelas. Depois, suba o ambiente como em "Subir e derrubar".
 
-**Installation failed.** The `web` or `chat-api` container stays up even when `pnpm install` fails, so the error only appears in the logs:
+**A instalação falhou.** O contêiner `web` ou `chat-api` fica de pé mesmo quando o `pnpm install` falha, então o erro só aparece no log:
 
-```Shell
+```bash
 docker compose -f compose.yaml logs chat-api
 ```
 
-After fixing the issue, run the installation again inside the container with `docker compose -f compose.yaml exec chat-api pnpm install`.
+Depois do conserto, rode a instalação de novo no contêiner, com `docker compose -f compose.yaml exec chat-api pnpm install`.
 
-### Inter-service Networking
+### Rede entre serviços
 
-When connecting between services (database, storage), whether in environment variables, configuration files, or code, **the host is always the Compose service name**, as shown in the "Container-to-Container Address" column of the table, and never `localhost` or `127.0.0.1`: inside a container, `localhost` refers to the container itself.
+Na conexão entre serviços (banco, storage), seja em variável de ambiente, arquivo de configuração ou código, **o host é sempre o nome do serviço do Compose**, como na coluna "Endereço entre contêineres" da tabela, e nunca `localhost` nem `127.0.0.1`: dentro de um contêiner, `localhost` é o próprio contêiner.
 
-**Exception:** when a process talks to something running inside the same container, the address is `127.0.0.1`. This is the case for a service healthcheck checking its own container, and tests that spin up a temporary server inside the container where they run.
+**Exceção:** quando o processo fala com algo que roda no mesmo contêiner, o endereço é `127.0.0.1`. É o caso do healthcheck de um serviço, que confere o próprio contêiner, e de um teste que abre um servidor temporário no contêiner onde roda.
 
-## Design and Figma
+## Design e Figma
 
-Figma is the project design tool, accessed via the `figma` MCP plugin server.
+O Figma é a ferramenta de design do projeto, acessada pelo servidor MCP do plugin `figma`.
 
-**Figma File:** [https://www.figma.com/design/plW17JDOoRHydUJIIi2u87/slack](https://www.figma.com/design/plW17JDOoRHydUJIIi2u87/slack)
+**Arquivo do Figma:** <https://www.figma.com/design/plW17JDOoRHydUJIIi2u87/slack>
 
-**Whenever a task involves design or interface, read `docs/design-system.md` first**, whether for designing in Figma or implementing a screen or component in code. It defines tokens, components, and the workflow with Figma (synchronization, steps from Figma to code, assets, and visual validation), and its rules are mandatory.
+**Sempre que a tarefa envolver design ou interface, leia antes o `docs/design-system.md`**, seja para desenhar no Figma, seja para implementar uma tela ou um componente no código. Ele define os tokens, os componentes e o fluxo de trabalho com o Figma (sincronia, passos do Figma para o código, assets e validação visual), e as regras dele são obrigatórias.
 
-## Planning
+## Planejamento
 
-Feature planning and documentation live in local markdown files, which serve as the project's issue tracker. Skills that publish to a tracker write to these files, in the paths below and without triage labels.
+O planejamento e a documentação das funcionalidades ficam em arquivos markdown locais, que são o issue tracker do projeto. As skills que publicam num tracker gravam nesses arquivos, nos caminhos abaixo e sem rótulos de triagem.
 
-The hierarchy is feature → task, and each feature has two documents: the PRD and the spec:
+A hierarquia é funcionalidade → tarefa, e cada funcionalidade tem dois documentos, o PRD e a spec:
 
-* **Feature:** a demonstrable delivery in the product, described solely by what a person can do, without technical details. This is not a Phase from `docs/product-brief.md`, which represents a product stage (MVP, operating as a product). The feature number is global, sequential, and does not change once assigned. In planning documents, "feature" always refers to this term; for the common meaning of the word, use another term (capability, behavior).
-* **PRD:** the product requirements for a feature (problem, flows, stories, acceptance criteria, out of scope), created via the `/prd` skill. It points to `docs/product-brief.md`, which covers the entire product, rather than repeating metrics and non-functional requirements.
-* **Spec:** how the feature will be built (implementation and test decisions). It follows and points to HLD, LLD, and ADRs.
-* **Task:** a deliverable part of a feature, derived from the spec. Technical work happens inside tasks. Before writing code, each task gets a **plan**, created by the `/plan-task` skill, which is approved and committed on its own in the **plan commit**. After that, the plan is frozen as a record of what was approved: only the user can unfreeze it, and any user decision that turns out to be wrong is corrected in the spec, LLD, or a new task. Outside the feature folder, a task is identified as `F<NN>-T<NN>`, such as `F01-T02`.
+- **Funcionalidade:** uma entrega demonstrável no produto, descrita só pelo que a pessoa consegue fazer, sem detalhes técnicos. Não é a Fase do `docs/product-brief.md`, que é uma fase do produto (MVP, operar como produto). O número da funcionalidade é global, sequencial e não muda depois de atribuído. Nos documentos de planejamento, "funcionalidade" é sempre este termo; para o sentido comum da palavra, use outra (recurso, comportamento).
+- **PRD:** os requisitos de produto de uma funcionalidade (problema, fluxos, histórias, critérios de aceite, fora de escopo), feito pela skill `/prd`. Aponta para o `docs/product-brief.md`, que cobre o produto inteiro, em vez de repetir métricas e requisitos não funcionais.
+- **Spec:** como a funcionalidade será construída (decisões de implementação e de teste). Segue o HLD, o LLD e as ADRs, apontando para eles.
+- **Tarefa:** uma parte entregável de uma funcionalidade, a partir da spec. É nas tarefas que entra o trabalho técnico. Antes do código, cada tarefa ganha um **plano**, feito pela skill `/plan-task`, que é aprovado e commitado sozinho, no **commit de plano**. Depois disso o plano fica congelado, como registro do que foi aprovado: só o usuário o descongela, e uma decisão dele que se mostrar errada é corrigida na spec, no LLD ou numa tarefa nova. Fora da pasta da funcionalidade, a tarefa é identificada como `F<NN>-T<NN>`, como `F01-T02`.
 
-**Folder Structure**
+**Estrutura de pastas**
 
 ```
-docs/features/<feature-num>-<title>/
+docs/funcionalidades/<num-funcionalidade>-<titulo>/
   prd.md
   spec.md
-  tasks/
-    <NN>-<title>/       ← one folder per task
-      task.md           ← the task
-      plan.md           ← the task plan
-      …                 ← task records, if necessary
+  tarefas/
+    <NN>-<titulo>/      ← uma pasta por tarefa
+      tarefa.md         ← a tarefa
+      plano.md          ← o plano da tarefa
+      …                 ← registros da tarefa, se necessário
 ```
 
-Numbers have two digits, and titles are in unaccented kebab-case (`01-sign-in-and-out`). Tasks are numbered starting from `01` within each feature, in dependency order.
+Os números têm dois dígitos e os títulos ficam em kebab-case sem acento (`01-entrar-e-sair`). As tarefas são numeradas a partir de `01` dentro de cada funcionalidade, na ordem de dependência.
 
-Aside from the task and plan, the task folder only receives records specific to that task, such as a manual test script, a measurement result, or visual validation screenshots. These are in Markdown or image formats, named in kebab-case (`manual-script.md`, `p95-measurement.md`). Code, test fixtures, and configuration never go into this folder: they belong in their respective project directories. Only `plan.md` is frozen in the plan commit; other records are written during implementation and included in the task PR.
+A pasta da tarefa só recebe, além da tarefa e do plano, registros da própria tarefa, como o roteiro de um teste manual, o resultado de uma medição ou as capturas de uma validação visual. Eles ficam em Markdown ou imagem, com nome em kebab-case (`roteiro-manual.md`, `medicao-p95.md`). Código, fixtures de teste e configuração nunca vão para essa pasta: ficam no projeto a que pertencem. Só o `plano.md` congela no commit de plano; os outros registros são escritos durante a implementação e entram no PR da tarefa.
 
 **Status**
 
-* The status of each feature (planned → PRD ready → spec ready → in progress → completed) lives in the roadmap, `docs/roadmap.md`, which also owns the feature list.
-* Task status (todo → in progress → completed) lives in a Status field at the top of its `task.md`. It transitions to "in progress" at the plan commit, and to "completed" in the PR that delivers it. A feature transitions to "in progress" at the first task plan commit, and to "completed" in the PR of its final task.
+- O status de cada funcionalidade (planejada → PRD pronto → spec pronta → em andamento → concluída) mora no roadmap, `docs/roadmap.md`, que também é dono da lista de funcionalidades.
+- O status da tarefa (a fazer → em andamento → concluída) fica num campo Status no topo do `tarefa.md` dela. Ela passa a "em andamento" no commit de plano, e a "concluída" no PR que a entrega. Uma funcionalidade passa a "em andamento" no primeiro commit de plano de uma tarefa dela, e a "concluída" no PR da última tarefa dela.
 
-## Git Conventions
+**Verificação completa**
 
-* **Main branch:** `main`. Never commit directly to it.
-* **Working branches:** `feature/*`, `bugfix/*`, `hotfix/*`, and `docs/*`, created from `main` and integrated via pull request.
-* **Commits:** short, descriptive messages focused on the "why" of the change.
-* **Merge:** merging is the user's decision. The agent only performs it when the user explicitly authorizes that PR or task. Without explicit authorization, the agent must not merge, and a denial of `gh pr merge` must not be bypassed through another path.
+É a sequência de comandos que fecha uma tarefa, rodada uma vez antes de abrir o PR, para cada projeto que a tarefa tocou. Os comandos de cada projeto estão na seção "Verificação completa" do `AGENTS.md` dele. Uma tarefa que cria um comando que a verificação deve rodar (uma suíte de testes nova, por exemplo) o acrescenta a essa seção.
 
-## Library Documentation Lookup
+## Convenções de Git
 
-When you need to consult a library's documentation, use context7 to retrieve up-to-date and accurate information.
+- **Branch principal:** `main`. Nunca faça commit direto nela.
+- **Branches de trabalho:** `feature/*`, `bugfix/*`, `hotfix/*` e `docs/*`, criadas a partir da `main` e integradas por pull request.
+- **Commits:** mensagens curtas e descritivas, focadas no porquê da mudança.
+- **Merge:** o merge é decisão do usuário. O agente só o faz quando o usuário autoriza expressamente aquele PR ou aquela tarefa. Sem autorização expressa, o agente não faz o merge, e uma negação do `gh pr merge` não se contorna por outro caminho.
+
+## Consulta à documentação de bibliotecas
+
+Quando precisar consultar a documentação de uma biblioteca, use o context7 para buscar informações atualizadas e precisas.
 
 ## Agent Skill Usage
 
-Always load the skills required for the given task.
-There are various convention and best-practice skills that can be loaded as needed by the task, in addition to those specific to each domain or technology used.
+Sempre carregue as skills necessárias para a tarefa em questão.
+Existem diversas skills de convenções e boas práticas que podem ser carregadas conforme a necessidade da tarefa, além das específicas para cada domínio ou tecnologia utilizada.
 
-When a skill diverges from memory files or rules, what is stated in AGENTS.md or rules takes precedence.
+Quando uma skill diverge dos arquivos de memory ou rules, o que está no AGENTS.md ou rules prevalece.

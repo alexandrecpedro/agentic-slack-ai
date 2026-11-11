@@ -1,16 +1,28 @@
 "use client";
 
-import { SendHorizontal } from "lucide-react";
-import { useId, useState } from "react";
+import { useComposerOffset } from "@/app/hooks/use-composer-offset";
+import { AtSign, CornerUpLeft, SendHorizontal, X } from "lucide-react";
+import { useId, useRef, useState } from "react";
+import { MentionPicker } from "@/app/components/message/mention-picker";
+import { useMentionPicker } from "@/app/hooks/use-mention-picker";
 import { IconButton } from "@/app/components/ui/icon-button";
 import { Kbd } from "@/app/components/ui/kbd";
-import { codePointLength, MESSAGE_MAX_LENGTH } from "@/app/utils/message-text";
+import { insertAt } from "@/app/utils/mention-query";
+import { overLimitBy, overLimitLabel } from "@/app/utils/message-text";
 
 type MessageComposerProps = {
-  // Sem o nome (Conversa ainda carregando), o rótulo é só "Mensagem".
-  conversationName?: string;
+  // "Mensagem para #nome" e as variantes da Conversa direta ("conversation-title.ts"); sem ele
+  // (Conversa ainda carregando), só "Mensagem".
+  label?: string;
   // A cada mudança do texto, inclusive o esvaziamento depois do envio: o aviso de "digitando".
   onTextChange?: (text: string) => void;
+  // A caixa de texto, para quem precisa pôr o foco nela (depois de apagar a última Mensagem).
+  inputRef?: React.RefObject<HTMLTextAreaElement | null>;
+  // A Conversa da lista de menções (spec da F06); sem ela, a caixa não tem a lista nem o botão @.
+  conversationId?: string;
+  // A Mensagem que a próxima vai citar, e como desistir dela (spec da F06, "Citação").
+  quoting?: { authorName: string; body: string } | null;
+  onCancelQuote?: () => void;
 } & (
   | {
       // Recebe o texto já sem as pontas; a lista mostra a Mensagem como "enviando" e a fila a
@@ -23,18 +35,33 @@ type MessageComposerProps = {
 );
 
 // Caixa de mensagem (MessageComposer): Enter envia e Shift+Enter quebra a linha. Acima do limite,
-// o contador toma o lugar da dica e o envio fica bloqueado. O botão de menções entra na F06.
+// o contador toma o lugar da dica e o envio fica bloqueado. O `@` abre a lista de menções, também
+// pelo botão @ (spec da F06, "Lista de menções").
 export function MessageComposer({
-  conversationName,
+  label = "Mensagem",
   onTextChange,
+  inputRef,
+  conversationId,
+  quoting,
+  onCancelQuote,
   onSend,
   disabled,
 }: MessageComposerProps) {
   const [text, setText] = useState("");
+  const localRef = useRef<HTMLTextAreaElement>(null);
+  const textarea = inputRef ?? localRef;
+  // A altura do campo, para os toasts ficarem acima dele (F08, o Alerta).
+  const container = useRef<HTMLDivElement>(null);
+  useComposerOffset(container);
+  const mentions = useMentionPicker({
+    conversationId,
+    text,
+    setText: changeText,
+    textareaRef: textarea,
+  });
   const body = text.trim();
-  const overLimit = codePointLength(body) - MESSAGE_MAX_LENGTH;
+  const overLimit = overLimitBy(body);
   const canSend = !disabled && body !== "" && overLimit <= 0;
-  const label = conversationName ? `Mensagem para #${conversationName}` : "Mensagem";
   // O contador fica ligado à caixa: o leitor de tela o lê com ela, sem anunciar cada tecla.
   const counterId = useId();
 
@@ -50,16 +77,36 @@ export function MessageComposer({
   }
 
   return (
-    <div className="shrink-0 px-5 pb-5">
+    <div ref={container} className="shrink-0 px-5 pb-5">
       <form
         onSubmit={(event) => {
           event.preventDefault();
           submit();
         }}
-        className="flex flex-col rounded-card border border-border-strong bg-surface focus-within:outline-2 focus-within:outline-focus"
+        className="relative flex flex-col rounded-card border border-border-strong bg-surface focus-within:outline-2 focus-within:outline-focus"
       >
+        {mentions.list && <MentionPicker {...mentions.list} />}
+        {quoting && (
+          <div className="flex min-w-0 items-center gap-2 border-b border-border-subtle px-3 py-2 text-small">
+            <CornerUpLeft size={16} aria-hidden className="shrink-0 text-fg-muted" />
+            <span className="shrink-0 font-bold text-fg">Respondendo a {quoting.authorName}</span>
+            <span className="truncate text-fg-muted">{quoting.body}</span>
+            <IconButton
+              icon={X}
+              label="Cancelar resposta"
+              size="sm"
+              className="ml-auto"
+              onClick={() => {
+                onCancelQuote?.();
+                textarea.current?.focus();
+              }}
+            />
+          </div>
+        )}
         <div className="flex px-3 pt-3 pb-1">
           <textarea
+            ref={textarea}
+            {...mentions.textareaProps}
             aria-label={label}
             aria-invalid={overLimit > 0 || undefined}
             aria-describedby={overLimit > 0 ? counterId : undefined}
@@ -68,8 +115,18 @@ export function MessageComposer({
             autoFocus={!disabled}
             disabled={disabled}
             value={text}
-            onChange={(event) => changeText(event.target.value)}
+            onChange={(event) => {
+              changeText(event.target.value);
+              mentions.handleChange(event);
+            }}
             onKeyDown={(event) => {
+              if (mentions.handleKeyDown(event)) return;
+              // Com a lista de menções fechada, o Esc desiste da Citação, sem apagar o texto.
+              if (event.key === "Escape" && quoting) {
+                event.preventDefault();
+                onCancelQuote?.();
+                return;
+              }
               if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 submit();
@@ -79,11 +136,23 @@ export function MessageComposer({
           />
         </div>
         <div className="flex items-center justify-end gap-3 p-1.5">
+          {conversationId && (
+            <IconButton
+              icon={AtSign}
+              label="Mencionar alguém"
+              size="sm"
+              className="mr-auto"
+              disabled={disabled}
+              onClick={() => {
+                const caret = textarea.current?.selectionStart ?? text.length;
+                const next = insertAt(text, caret);
+                mentions.replaceText(next.text, next.caret);
+              }}
+            />
+          )}
           {overLimit > 0 ? (
             <p id={counterId} className="text-caption text-danger-fg">
-              {overLimit === 1
-                ? "1 caractere acima do limite"
-                : `${overLimit} caracteres acima do limite`}
+              {overLimitLabel(overLimit)}
             </p>
           ) : (
             <p className="hidden items-center gap-1 text-caption text-fg-muted sm:flex">

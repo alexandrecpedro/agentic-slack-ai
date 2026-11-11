@@ -1,18 +1,49 @@
-name: fullcycle-slack-ai
+name: fullcycle-slack-ia
 
 services:
   web:
     build:
       context: ./apps/web
       dockerfile: Dockerfile.dev
-    # Init as PID 1: CMD's sh ignores SIGTERM, and without it every stop ends in kill (137).
+    # Init como PID 1: o sh do CMD ignora SIGTERM, e sem isso todo stop termina em kill (137).
     init: true
     volumes:
-      # Entire repository: file: ../../packages/chat-events needs to resolve identically both inside and outside.
+      # Repositório inteiro: o file:../../packages/chat-events precisa resolver igual dentro e fora.
       - .:/home/node/app
+    environment:
+      CHAT_API_URL: http://chat-api:3000
+      # Endereço em que o navegador abre o WebSocket da API do chat.
+      CHAT_API_PUBLIC_URL: http://localhost:3001
+      SESSION_COOKIE_NAME: fc_session
+      SESSION_COOKIE_SECURE: "false"
     ports:
       - "3000:3000"
     depends_on:
+      - chat-api
+
+  # Testes de ponta a ponta do web e playwright-cli. Sobe só com --profile e2e e fica parado.
+  e2e:
+    # Mesma versão exata do @playwright/test do apps/web/package.json.
+    image: mcr.microsoft.com/playwright:v1.65.0-noble
+    profiles: [e2e]
+    init: true
+    user: "1000:1000"
+    working_dir: /home/node/app/apps/web
+    volumes:
+      - .:/home/node/app
+    environment:
+      # O navegador do teste abre a web e a API por localhost, como o da máquina, pelo
+      # encaminhador de portas (LLD, "Ambiente de desenvolvimento").
+      BASE_URL: http://localhost:3000
+      # As fixtures gravam as Pessoas de teste direto no banco chat (LLD, "Ambiente de desenvolvimento").
+      DATABASE_URL: postgres://chat:chat@postgres:5432/chat
+      # A fixture da recuperação apaga a época dos eventos no Redis de desenvolvimento.
+      REDIS_URL: redis://redis:6379/0
+      PLAYWRIGHT_HTML_OPEN: never
+      HOME: /tmp
+    command: ["node", "e2e/support/port-forward.mjs"]
+    depends_on:
+      - web
       - chat-api
 
   chat-api:
@@ -26,12 +57,22 @@ services:
       DATABASE_URL: postgres://chat:chat@postgres:5432/chat
       TEST_DATABASE_URL: postgres://chat:chat@postgres:5432/chat_test
       TEST_DATABASE_ADMIN_URL: postgres://postgres:postgres@postgres:5432/postgres
+      SESSION_COOKIE_NAME: fc_session
+      SESSION_TTL_DAYS: "30"
+      # Origem da web aceita no handshake do WebSocket.
+      WEB_ORIGIN: http://localhost:3000
+      # Eventos por Pessoa para a reconexão; os testes usam o banco lógico 1.
+      REDIS_URL: redis://redis:6379/0
+      TEST_REDIS_URL: redis://redis:6379/1
     ports:
       - "3001:3000"
     depends_on:
       postgres:
         condition: service_healthy
       s3:
+        condition: service_started
+      # A API sobe mesmo com o Redis fora: a reconexão só passa a recarregar.
+      redis:
         condition: service_started
 
   postgres:
@@ -50,7 +91,20 @@ services:
       timeout: 5s
       retries: 10
 
-  # Local replacement for S3-compatible storage.
+  # Eventos por Pessoa para a reconexão do WebSocket (HLD 6.2).
+  redis:
+    image: redis:8
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Substituto local do armazenamento compatível com S3.
   s3:
     image: chrislusf/seaweedfs:4.52
     command: ["mini", "-dir=/data"]
@@ -66,3 +120,4 @@ services:
 volumes:
   postgres-data:
   s3-data:
+  redis-data:

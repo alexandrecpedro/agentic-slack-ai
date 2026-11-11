@@ -127,6 +127,51 @@ describe('Canais novos em tempo real', () => {
     expect(eventsOf(otherEvents, conversation.id)).toHaveLength(0);
   });
 
+  it('a abertura da Conversa direta chega às abas de quem abriu e não à outra Pessoa', async () => {
+    const opener = await authRoutes.loggedIn(app);
+    const other = await authRoutes.loggedIn(app);
+    const openerTab = await listening(opener.token);
+    const otherEvents = await listening(other.token);
+
+    const response = await conversationRoutes.openDirect(
+      app,
+      opener.cookie,
+      other.person.id,
+    );
+
+    const { conversation } = response.body as {
+      conversation: ConversationBody;
+    };
+    const event = await waitForConversation(openerTab, conversation.id);
+    expect(event.person_ids).toEqual([opener.person.id]);
+    expect(event.conversation.counterpart?.id).toBe(other.person.id);
+    await settle();
+    expect(eventsOf(otherEvents, conversation.id)).toHaveLength(0);
+  });
+
+  it('abrir de novo a Conversa direta não publica', async () => {
+    const opener = await authRoutes.loggedIn(app);
+    const other = await authRoutes.loggedIn(app);
+    // Ouvindo desde antes da primeira abertura: o evento dela sai depois da resposta e, sem esperar
+    // por ele, poderia chegar depois da segunda e contar como dela.
+    const events = await listening(opener.token);
+    const first = await conversationRoutes.openDirect(
+      app,
+      opener.cookie,
+      other.person.id,
+    );
+    const { id } = (first.body as { conversation: ConversationBody })
+      .conversation;
+    // Outros testes criam Canais públicos ao mesmo tempo: espera o evento desta Conversa, e falha se
+    // ele não chegar.
+    await waitForConversation(events, id);
+
+    await conversationRoutes.openDirect(app, opener.cookie, other.person.id);
+
+    await settle();
+    expect(eventsOf(events, id)).toHaveLength(1);
+  });
+
   const privateChannelOf = (cookie: string) =>
     conversationRoutes.privateChannelOf(app, cookie);
 
@@ -222,6 +267,131 @@ describe('Canais novos em tempo real', () => {
       eventsOf(replayed, id).map((event) => event.event_id),
     );
     expect(cursors.size).toBe(1);
+  });
+});
+
+describe('Conversa direta na primeira Mensagem', () => {
+  let app: INestApplication;
+  let url: string;
+  const sockets: TestSocket[] = [];
+
+  beforeAll(async () => {
+    ({ app, url } = await listenTestApp());
+  });
+
+  afterEach(() => {
+    sockets.splice(0).forEach((socket) => socket.disconnect());
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  // Os eventos da Conversa na ordem em que chegam, os dois tipos numa lista só.
+  function inOrder(socket: TestSocket, conversationId: string) {
+    const received: { name: string; person_ids?: string[] }[] = [];
+    socket.on('conversation.member_added', (event) => {
+      if (event.conversation.id === conversationId) {
+        received.push({ name: 'member_added', person_ids: event.person_ids });
+      }
+    });
+    socket.on('message.created', (event) => {
+      if (event.message.conversation_id === conversationId) {
+        received.push({ name: 'message.created' });
+      }
+    });
+    return received;
+  }
+
+  async function openedBy() {
+    const opener = await authRoutes.loggedIn(app);
+    const other = await authRoutes.loggedIn(app);
+    const response = await conversationRoutes.openDirect(
+      app,
+      opener.cookie,
+      other.person.id,
+    );
+    const { id } = (response.body as { conversation: ConversationBody })
+      .conversation;
+    return { opener, other, id };
+  }
+
+  it('a primeira Mensagem da Conversa direta entrega o member_added e depois a Mensagem', async () => {
+    const { opener, other, id } = await openedBy();
+    const socket = await realtimeRoutes.connected(url, { token: other.token });
+    sockets.push(socket);
+    const received = inOrder(socket, id);
+
+    await conversationRoutes.sendMessage(app, opener.cookie, id).expect(201);
+
+    await waitForCount(received, 2);
+    expect(received.map((event) => event.name)).toEqual([
+      'member_added',
+      'message.created',
+    ]);
+    expect(received[0].person_ids).toEqual([other.person.id]);
+  });
+
+  it('duas Mensagens ao mesmo tempo chegam depois do member_added', async () => {
+    const { opener, other, id } = await openedBy();
+    const socket = await realtimeRoutes.connected(url, { token: other.token });
+    sockets.push(socket);
+    const received = inOrder(socket, id);
+
+    await Promise.all([
+      conversationRoutes.sendMessage(app, opener.cookie, id).expect(201),
+      conversationRoutes.sendMessage(app, opener.cookie, id).expect(201),
+    ]);
+
+    await waitForCount(received, 3);
+    expect(received.map((event) => event.name)).toEqual([
+      'member_added',
+      'message.created',
+      'message.created',
+    ]);
+  });
+
+  it('a segunda Mensagem só entrega a Mensagem', async () => {
+    const { opener, other, id } = await openedBy();
+    await conversationRoutes.sendMessage(app, opener.cookie, id).expect(201);
+    await settle();
+    const socket = await realtimeRoutes.connected(url, { token: other.token });
+    sockets.push(socket);
+    const received = inOrder(socket, id);
+
+    await conversationRoutes.sendMessage(app, opener.cookie, id).expect(201);
+
+    await waitForCount(received, 1);
+    await settle();
+    expect(received.map((event) => event.name)).toEqual(['message.created']);
+  });
+
+  it('os dois voltam na reconexão na mesma ordem', async () => {
+    const { opener, other, id } = await openedBy();
+    // Um evento antes da conexão: sem stream, o cursor 0-0 conta como perdido (spec da F03).
+    await conversationRoutes.privateChannelOf(app, other.cookie);
+    const first = realtimeRoutes.socket(url, { token: other.token });
+    sockets.push(first);
+    const syncs = collectEvents(first, 'sync');
+    first.connect();
+    const [{ cursor }] = await waitForCount(syncs, 1);
+    first.disconnect();
+    await conversationRoutes.sendMessage(app, opener.cookie, id).expect(201);
+    await settle();
+
+    const second = realtimeRoutes.socket(url, {
+      token: other.token,
+      cursor: cursor ?? undefined,
+    });
+    sockets.push(second);
+    const received = inOrder(second, id);
+    second.connect();
+
+    await waitForCount(received, 2);
+    expect(received.map((event) => event.name)).toEqual([
+      'member_added',
+      'message.created',
+    ]);
   });
 });
 

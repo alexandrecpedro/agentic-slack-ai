@@ -1,5 +1,9 @@
 import { INestApplication } from '@nestjs/common';
-import type { MessageCreatedEvent } from 'chat-events';
+import type {
+  MessageCreatedEvent,
+  MessageDeletedEvent,
+  MessageUpdatedEvent,
+} from 'chat-events';
 import { randomUUID } from 'node:crypto';
 import { authRoutes } from './support/auth-routes';
 import { conversationRoutes } from './support/conversation-routes';
@@ -112,6 +116,127 @@ describe('Mensagens em tempo real', () => {
 
     await settle();
     expect(received).toHaveLength(1);
+  });
+
+  function editMessage(
+    cookie: string,
+    conversationId: string,
+    messageId: string,
+    body: string,
+  ) {
+    return conversationRoutes.editMessage(
+      app,
+      cookie,
+      conversationId,
+      messageId,
+      body,
+    );
+  }
+
+  async function sentId(cookie: string, conversationId: string) {
+    const response = await send(cookie, conversationId).expect(201);
+    return (response.body as { message: { id: string } }).message.id;
+  }
+
+  it('a edição emite message.updated para os Membros e as abas do autor', async () => {
+    const author = await authRoutes.loggedIn(app, { name: 'Ana Souza' });
+    const reader = await authRoutes.loggedIn(app, { name: 'Bruno Lima' });
+    const outsider = await authRoutes.loggedIn(app);
+    const channel = await conversationRoutes.createChannel(app);
+    await conversationRoutes.removeMembership(
+      app,
+      channel.id,
+      outsider.person.id,
+    );
+    const messageId = await sentId(author.cookie, channel.id);
+    const forReader = collectEvents(
+      await connected(reader.token),
+      'message.updated',
+    );
+    const forAuthor = collectEvents(
+      await connected(author.token),
+      'message.updated',
+    );
+    const forOutsider = collectEvents(
+      await connected(outsider.token),
+      'message.updated',
+    );
+
+    const response = await editMessage(
+      author.cookie,
+      channel.id,
+      messageId,
+      'Texto novo',
+    );
+
+    const [event] = await waitForCount(forReader, 1);
+    await waitForCount(forAuthor, 1);
+    await settle();
+    expect(response.status).toBe(200);
+    expect(event).toEqual<MessageUpdatedEvent>({
+      event_id: expect.stringMatching(/^[^:]+:\d+-\d+$/) as string,
+      message: (response.body as { message: MessageUpdatedEvent['message'] })
+        .message,
+    });
+    expect(forOutsider).toHaveLength(0);
+  });
+
+  it('editar com o mesmo texto não emite nada', async () => {
+    const author = await authRoutes.loggedIn(app);
+    const channel = await conversationRoutes.createChannel(app);
+    const messageId = await sentId(author.cookie, channel.id);
+    const received = collectEvents(
+      await connected(author.token),
+      'message.updated',
+    );
+
+    await editMessage(
+      author.cookie,
+      channel.id,
+      messageId,
+      'Chegou na hora',
+    ).expect(200);
+
+    await settle();
+    expect(received).toHaveLength(0);
+  });
+
+  it('a exclusão emite message.deleted para os Membros', async () => {
+    const author = await authRoutes.loggedIn(app, { name: 'Ana Souza' });
+    const reader = await authRoutes.loggedIn(app, { name: 'Bruno Lima' });
+    const outsider = await authRoutes.loggedIn(app);
+    const channel = await conversationRoutes.createChannel(app);
+    await conversationRoutes.removeMembership(
+      app,
+      channel.id,
+      outsider.person.id,
+    );
+    const messageId = await sentId(author.cookie, channel.id);
+    const forReader = collectEvents(
+      await connected(reader.token),
+      'message.deleted',
+    );
+    const forOutsider = collectEvents(
+      await connected(outsider.token),
+      'message.deleted',
+    );
+
+    const response = await conversationRoutes.deleteMessage(
+      app,
+      author.cookie,
+      channel.id,
+      messageId,
+    );
+
+    const [event] = await waitForCount(forReader, 1);
+    await settle();
+    expect(response.status).toBe(204);
+    expect(event).toEqual<MessageDeletedEvent>({
+      event_id: expect.stringMatching(/^[^:]+:\d+-\d+$/) as string,
+      conversation_id: channel.id,
+      message_id: messageId,
+    });
+    expect(forOutsider).toHaveLength(0);
   });
 
   it('emite sync com reset na conexão', async () => {

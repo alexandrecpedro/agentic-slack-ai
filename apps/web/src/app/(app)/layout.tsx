@@ -2,14 +2,22 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { Suspense } from "react";
 import { BfcacheReload } from "@/app/components/bfcache-reload";
+import { AlertCenter } from "@/app/components/notification/alert-center";
+import { PeopleProvider } from "@/app/components/people/people-provider";
+import { EditProfileProvider } from "@/app/components/profile/edit-profile-dialog";
+import { ProfilePanel } from "@/app/components/profile/profile-panel";
+import { ProfilePanelProvider } from "@/app/components/profile/profile-panel-provider";
 import { ConnectionBanner } from "@/app/components/realtime/connection-banner";
 import { RealtimeProvider } from "@/app/components/realtime/realtime-provider";
 import { AppLoading } from "@/app/components/session/app-loading";
 import { SessionError } from "@/app/components/session/session-error";
+import { ThemeProvider } from "@/app/components/session/theme-provider";
 import { TimeZoneSync } from "@/app/components/session/time-zone-sync";
+import { DocumentTitle } from "@/app/components/workspace-nav/document-title";
 import { NavigationDrawer } from "@/app/components/workspace-nav/navigation-drawer";
 import { Rail } from "@/app/components/workspace-nav/rail";
 import { Sidebar } from "@/app/components/workspace-nav/sidebar";
+import { Toaster } from "@/app/components/ui/toaster";
 import { env } from "@/app/config/env";
 import { getCurrentPerson } from "@/app/services/chat-api";
 import { readSessionToken } from "@/app/services/session-cookie";
@@ -48,23 +56,35 @@ async function AuthenticatedShell({ children }: { children: React.ReactNode }) {
 
   return (
     <RealtimeProvider url={env.CHAT_API_PUBLIC_URL}>
-      <div className="flex h-screen flex-col">
-        <ConnectionBanner />
-        <div className="flex min-h-0 flex-1">
-          <BfcacheReload />
-          <TimeZoneSync />
-          <NavigationDrawer
-            navigation={
-              <>
-                <Rail person={result.person} />
-                <Sidebar personId={result.person.id} />
-              </>
-            }
-          >
-            <main className="flex min-w-0 flex-1 flex-col bg-surface">{children}</main>
-          </NavigationDrawer>
+      <ThemeProvider personTheme={result.person.theme}>
+      <ProfilePanelProvider>
+      <PeopleProvider sessionPerson={{ id: result.person.id, name: result.person.name }}>
+        <EditProfileProvider sessionPersonId={result.person.id}>
+        <div className="flex h-screen flex-col">
+          <ConnectionBanner />
+          <div className="relative flex min-h-0 flex-1">
+            <BfcacheReload />
+            <TimeZoneSync personId={result.person.id} personTimeZone={result.person.timeZone} />
+            <DocumentTitle personId={result.person.id} />
+            <NavigationDrawer
+              navigation={
+                <>
+                  <Rail person={result.person} />
+                  <Sidebar personId={result.person.id} />
+                </>
+              }
+            >
+              <main className="flex min-w-0 flex-1 flex-col bg-surface">{children}</main>
+              <ProfilePanel sessionPersonId={result.person.id} />
+            </NavigationDrawer>
+          </div>
         </div>
-      </div>
+        <Toaster />
+        <AlertCenter personId={result.person.id} />
+        </EditProfileProvider>
+      </PeopleProvider>
+      </ProfilePanelProvider>
+      </ThemeProvider>
     </RealtimeProvider>
   );
 }

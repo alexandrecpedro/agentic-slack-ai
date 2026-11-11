@@ -4,6 +4,7 @@ import {
   ConnectedSocket,
   MessageBody,
   OnGatewayConnection,
+  OnGatewayDisconnect,
   OnGatewayInit,
   SubscribeMessage,
   WebSocketGateway,
@@ -14,7 +15,7 @@ import type {
   ConversationRef,
   HandshakeAuth,
   HandshakeErrorCode,
-  MessageCreatedEvent,
+  StoredEvent,
 } from 'chat-events';
 import { ConversationNotFoundError } from '../conversations/conversation-not-found.error';
 import { ConversationsService } from '../conversations/conversations.service';
@@ -22,7 +23,15 @@ import { Env } from '../config/env.schema';
 import { readSessionCookie } from '../sessions/session-cookie';
 import { SessionsService } from '../sessions/sessions.service';
 import { UnauthenticatedError } from '../sessions/unauthenticated.error';
-import { conversationRoom, personRoom, sessionRoom } from './realtime-socket';
+import {
+  conversationRoom,
+  emitStoredEvent,
+  isStoredEventName,
+  personRoom,
+  sessionRoom,
+  WORKSPACE_ROOM,
+} from './realtime-socket';
+import { PresenceTracker } from '../presence/presence-tracker';
 import { EventsStore } from './events.store';
 import { SESSION_RECHECK_INTERVAL_MS } from './realtime-values';
 import type { RealtimeServer, RealtimeSocket } from './realtime-socket';
@@ -32,14 +41,13 @@ const UNAUTHENTICATED: HandshakeErrorCode = 'unauthenticated';
 // WebSocket da API do chat (spec da F03, "Conexão" e "Sessão no WebSocket"). O handshake verifica a
 // Sessão pelo mesmo authenticate do guard REST e põe o socket nas salas da Pessoa e da Sessão.
 
-// Os eventos guardados por Pessoa que a reconexão reenvia (StoredEventPayloads, em chat-events).
-const STORED_EVENT_NAMES = new Set<string>([
-  'message.created',
-  'conversation.member_added',
-]);
 @WebSocketGateway()
 export class RealtimeGateway
-  implements OnGatewayInit, OnGatewayConnection, OnModuleDestroy
+  implements
+    OnGatewayInit,
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnModuleDestroy
 {
   private readonly logger = new Logger(RealtimeGateway.name);
 
@@ -51,10 +59,12 @@ export class RealtimeGateway
     private readonly config: ConfigService<Env, true>,
     private readonly conversations: ConversationsService,
     private readonly events: EventsStore,
+    private readonly presence: PresenceTracker,
   ) {}
 
   private recheckTimer?: ReturnType<typeof setInterval>;
   private stopListening?: () => void;
+  private stopPresence?: () => void;
 
   afterInit(server: RealtimeServer): void {
     // Sair desconecta na hora as abas daquela Sessão (LLD, "Sessão e login", "WebSocket").
@@ -75,6 +85,13 @@ export class RealtimeGateway
         });
     }, SESSION_RECHECK_INTERVAL_MS);
     this.recheckTimer.unref();
+    // A Presença que mudou vai para todo o workspace, sem guardar (spec da F09, "Tempo real").
+    this.stopPresence = this.presence.onChange((personId, presence) => {
+      server.to(WORKSPACE_ROOM).emit('presence.changed', {
+        person_id: personId,
+        presence,
+      });
+    });
     const cookieName = this.config.get('SESSION_COOKIE_NAME', { infer: true });
     server.use((socket, next) => {
       void this.authenticateSocket(socket, cookieName, next);
@@ -88,6 +105,7 @@ export class RealtimeGateway
   // mais recente.
   async handleConnection(socket: RealtimeSocket): Promise<void> {
     const personId = socket.data.person.id;
+    this.presence.connected(personId, socket.data.person.presenceChoice);
     const auth = socket.handshake.auth as HandshakeAuth | undefined;
     const cursor = typeof auth?.cursor === 'string' ? auth.cursor : undefined;
     try {
@@ -106,9 +124,9 @@ export class RealtimeGateway
       // Os eventos guardados voltam na ordem do stream; um nome desconhecido, de uma versão
       // anterior ou posterior, fica de fora.
       for (const event of result.events) {
-        if (!STORED_EVENT_NAMES.has(event.name)) continue;
-        socket.emit(event.name as 'message.created', {
-          ...(event.payload as MessageCreatedEvent),
+        if (!isStoredEventName(event.name)) continue;
+        emitStoredEvent(socket, event.name, {
+          ...(event.payload as StoredEvent),
           event_id: event.cursor,
         });
       }
@@ -219,9 +237,29 @@ export class RealtimeGateway
       });
   }
 
+  // O nome novo nos sockets da Pessoa, para o "digitando" sair com ele sem reconectar (spec da F09,
+  // "Tempo real"). Só os sockets desta instância, a única (HLD, seção 6.2).
+  renamePerson(personId: string, name: string): void {
+    const socketIds = this.server.sockets.adapter.rooms.get(
+      personRoom(personId),
+    );
+    for (const socketId of socketIds ?? []) {
+      const socket = this.server.sockets.sockets.get(socketId);
+      if (socket) socket.data.person.name = name;
+    }
+  }
+
+  // A aba que caiu conta para a Presença (spec da F09, "Presença"). Só as que passaram do handshake
+  // têm a Pessoa.
+  handleDisconnect(socket: RealtimeSocket): void {
+    const personId = socket.data.person?.id;
+    if (personId) this.presence.disconnected(personId);
+  }
+
   onModuleDestroy(): void {
     clearInterval(this.recheckTimer);
     this.stopListening?.();
+    this.stopPresence?.();
   }
 
   // Reconfere as Sessões das abas conectadas, uma vez por Sessão e uma de cada vez, para não
@@ -270,7 +308,11 @@ export class RealtimeGateway
       socket.data.sessionId = sessionId;
       socket.data.sessionToken = token ?? '';
       // As salas entram antes do CONNECT: nenhum evento emitido logo depois se perde.
-      await socket.join([personRoom(person.id), sessionRoom(sessionId)]);
+      await socket.join([
+        personRoom(person.id),
+        sessionRoom(sessionId),
+        WORKSPACE_ROOM,
+      ]);
       next();
     } catch (error) {
       if (error instanceof UnauthenticatedError) {

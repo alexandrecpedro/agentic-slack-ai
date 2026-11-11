@@ -10,6 +10,9 @@ function message(id: string): Message {
     author: { id: "p1", name: "Ana Souza", initials: "AS" },
     body: `Mensagem ${id}`,
     createdAt: "2026-11-09T12:00:00.000Z",
+    editedAt: null,
+    mentions: [],
+    quote: null,
   };
 }
 

@@ -1,8 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConflictingPeopleFiltersError } from './conflicting-people-filters.error';
 import { toConversationResponse } from '../conversations/conversation.response';
 import type {
   ConversationSummary,
   NewChannel,
+  OpenedDirectConversation,
 } from '../conversations/conversations.service';
 import { ConversationsService } from '../conversations/conversations.service';
 import { PeopleService } from '../people/people.service';
@@ -28,18 +30,30 @@ export class MembershipsService {
     private readonly publisher: RealtimePublisher,
   ) {}
 
-  // Pessoas para adicionar a uma Conversa de que quem busca é Membro, sem os Membros dela, em ordem
+  // Pessoas para adicionar a uma Conversa de que quem busca é Membro, sem os Membros dela, ou, sem a
+  // Conversa, todas (o "Nova conversa", spec da F05), em ordem
   // alfabética (spec da F04, "Busca de Pessoas").
+  // Fora dos Membros de uma Conversa (adicionar ao Canal privado), só entre eles (lista de menções,
+  // spec da F06) ou sem filtro ("Nova conversa"). Quem busca precisa ser Membro da Conversa.
   async searchPeople(
     personId: string,
-    conversationId: string,
+    { notMemberOf, memberOf }: { notMemberOf?: string; memberOf?: string },
     q: string,
   ): Promise<PersonSummary[]> {
-    await this.conversations.getForMember(personId, conversationId);
-    const memberIds = await this.conversations.listMemberIds(conversationId);
+    if (notMemberOf !== undefined && memberOf !== undefined) {
+      throw new ConflictingPeopleFiltersError();
+    }
+    const conversationId = notMemberOf ?? memberOf;
+    let memberIds: string[] = [];
+    if (conversationId !== undefined) {
+      await this.conversations.getForMember(personId, conversationId);
+      memberIds = await this.conversations.listMemberIds(conversationId);
+    }
     const people = await this.people.search(
       q.trim(),
-      memberIds,
+      memberOf !== undefined
+        ? { onlyIds: memberIds }
+        : { excludeIds: memberIds },
       PEOPLE_SEARCH_LIMIT,
     );
     return sortedSummaries(people);
@@ -54,7 +68,7 @@ export class MembershipsService {
     const { summary, addedIds, memberIds } =
       await this.conversations.addMembers(personId, conversationId, personIds);
     if (addedIds.length > 0) {
-      this.publishMemberAdded(summary, memberIds, addedIds);
+      void this.announceMemberAdded(summary, memberIds, addedIds);
     }
     return { addedIds, memberCount: summary.memberCount };
   }
@@ -67,21 +81,63 @@ export class MembershipsService {
   ): Promise<ConversationSummary> {
     const { created, memberIds, ...summary } =
       await this.conversations.createChannel(creatorId, newChannel);
-    if (created) this.publishMemberAdded(summary, memberIds, memberIds);
+    if (created) void this.announceMemberAdded(summary, memberIds, memberIds);
     return summary;
   }
 
+  // Abre a Conversa direta e, só quando quem abriu virou Membro agora, avisa os Membros dela: as
+  // outras abas de quem abriu e, se ela já abriu antes, a outra Pessoa (spec da F05, "Tempo real").
+  async openDirectConversation(
+    openerId: string,
+    personId: string,
+  ): Promise<OpenedDirectConversation> {
+    const opened = await this.conversations.openDirectConversation(
+      openerId,
+      personId,
+    );
+    if (opened.joined)
+      void this.announceMemberAdded(opened, opened.memberIds, [openerId]);
+    return opened;
+  }
+
+  // A entrada da outra Pessoa da Conversa direta na primeira Mensagem (spec da F05, "Tempo real"):
+  // monta a Conversa pelo lado de cada Membro e publica, para o envio esperar antes da Mensagem.
+  async announceDirectJoin(
+    conversationId: string,
+    memberIds: string[],
+    joinedId: string,
+  ): Promise<void> {
+    const conversation = await this.conversations.getForMember(
+      joinedId,
+      conversationId,
+    );
+    const [summary] = await this.conversations.withMemberCounts([conversation]);
+    await this.announceMemberAdded(summary, memberIds, [joinedId]);
+  }
+
   // Publica sem prender a resposta: a gravação já aconteceu, e a falha vai para o log, como no envio
-  // de Mensagem.
-  private publishMemberAdded(
+  // de Mensagem. Devolve a promessa, que nunca rejeita, para o envio de Mensagem esperar por ela
+  // antes de publicar a Mensagem (spec da F05, "Tempo real", "Ordem").
+  announceMemberAdded(
     summary: ConversationSummary,
     memberIds: string[],
     addedIds: string[],
-  ): void {
-    this.publisher
-      .memberAdded(memberIds, toConversationResponse(summary), addedIds)
+  ): Promise<void> {
+    return this.publisher
+      .memberAdded(
+        memberIds,
+        // Só a Conversa direta muda de quem recebe para quem recebe; a do Canal é montada uma vez.
+        summary.conversation.kind === 'direct'
+          ? (personId) => toConversationResponse(summary, personId)
+          : constant(toConversationResponse(summary, '')),
+        addedIds,
+      )
       .catch((error: unknown) =>
         this.logger.error('Falha ao publicar a participação gravada', error),
       );
   }
+}
+
+function constant<T>(value: T): () => T {
+  return () => value;
 }

@@ -13,14 +13,14 @@ Um token muda nos três lugares na mesma tarefa: a variable no Figma, este docum
 
 ## Estado atual
 
-O Figma tem as fundações, os componentes e as telas; o código ainda é o esqueleto do `create-next-app`.
+O Figma tem as fundações, os componentes e as telas; o código tem os tokens e recebe os componentes à medida que as telas os usam.
 
 | Item | Figma | Código |
 | --- | --- | --- |
-| Tokens | 3 coleções de variables (`Primitives`, `Semantic`, `Layout`), 14 estilos de texto, 3 de elevação | `globals.css` só tem `--background` e `--foreground` do esqueleto |
-| Componentes | 57 componentes em 3 seções, mais 42 ícones | Nenhum |
-| Telas | 129 frames de 1440 × 900, em 10 seções | Só a página inicial do esqueleto |
-| Bibliotecas | Desenho pensado para `lucide-react`, Radix, CVA e Sonner | Só `next`, `react` e `tailwindcss` instalados |
+| Tokens | 3 coleções de variables (`Primitives`, `Semantic`, `Layout`), 14 estilos de texto, 3 de elevação | `globals.css` com o conjunto completo, nos temas claro e escuro |
+| Componentes | 57 componentes em 3 seções, mais 42 ícones | Os da F01: Button, Input, Field, Spinner, Avatar, EmptyState, DropdownMenu, Rail, Sidebar e UserMenu |
+| Telas | 129 frames de 1440 × 900, em 10 seções | As da F01: Login, Home / Vazio, o menu do usuário e as portas de carregamento e de erro de sessão |
+| Bibliotecas | Desenho pensado para `lucide-react`, Radix, CVA e Sonner | `lucide-react`, `radix-ui` e CVA instalados; Sonner a instalar |
 
 As descrições dos componentes no Figma citam arquivos de uma implementação de referência (`shared/ui/button.tsx`, `entities/message/ui/message-item.tsx` e outros, no estilo Feature-Sliced Design). Esses arquivos não existem neste repositório. Use as descrições pelo comportamento que documentam, não pelos caminhos; a pasta de cada componente segue a seção "Organização no código" abaixo.
 
@@ -31,11 +31,11 @@ As descrições dos componentes no Figma citam arquivos de uma implementação d
 | Framework | Next.js 16 (App Router, `src/app`), React 19 | Instalado |
 | Estilo | Tailwind CSS 4, configurado só em CSS (`@theme`), sem `tailwind.config` | Instalado |
 | Build | Turbopack, com o loader `@tailwindcss/turbopack` no `next.config.ts` | Instalado |
-| Ícones | `lucide-react` | A instalar |
-| Primitivos acessíveis | `radix-ui` (Dialog, AlertDialog, DropdownMenu, Tooltip, Switch, Tabs) | A instalar |
-| Variantes | `class-variance-authority`, com `clsx` e `tailwind-merge` num helper `cn` em `src/app/utils/cn.ts` | A instalar |
-| Toasts | `sonner` | A instalar |
-| Fonte | Lato pelo `next/font/google` | A trocar (hoje é Geist) |
+| Ícones | `lucide-react` | Instalado |
+| Primitivos acessíveis | `radix-ui` (Dialog, AlertDialog, DropdownMenu, Tooltip, Switch, Tabs) | Instalado |
+| Variantes | `class-variance-authority`, com `clsx` e `tailwind-merge` num helper `cn` em `src/app/utils/cn.ts` | Instalado |
+| Toasts | `sonner` | Instalado |
+| Fonte | Lato pelo `next/font/google` | Instalada |
 
 Instale uma biblioteca quando o primeiro componente precisar dela, sempre dentro do contêiner (`docker compose -f compose.yaml exec web pnpm add <pacote>`). O arquivo do Figma tem kits da comunidade ligados (Material 3, Simple Design System, kits da Apple): **não use nenhum deles**. O produto usa só as variables e os componentes locais do arquivo.
 
@@ -68,7 +68,7 @@ Abaixo está o `globals.css` de destino. Os valores são os primitivos já resol
   /* texto */
   --fg: #1d1c1d;                    /* neutral/900 */
   --fg-muted: #616061;              /* neutral/600 */
-  --fg-subtle: #868686;             /* neutral/500 */
+  --fg-subtle: #868686;             /* neutral/500; abaixo de 4,5:1 no claro, não serve para texto de 15 px nem placeholder */
   --fg-inverse: #ffffff;            /* neutral/0 */
   /* bordas */
   --border: #dddddd;                /* neutral/300 */
@@ -236,7 +236,7 @@ Resultado: `bg-surface`, `text-fg-muted`, `border-border-subtle`, `bg-primary ho
 
 ### Tema claro e escuro
 
-A pessoa escolhe o tema (brief, "Escopo do MVP", item 7). O tema fica no atributo `data-theme` do `<html>`, aplicado no servidor para não piscar na carga. Sem o atributo, vale o claro. Onde a escolha é gravada é decisão do LLD (seção "8. Cliente", ainda a definir).
+A pessoa escolhe o tema (brief, "Escopo do MVP", item 7). O tema fica no atributo `data-theme` do `<html>`, aplicado no servidor para não piscar na carga. Sem o atributo, vale o claro. A escolha fica na Pessoa, com um cookie que a espelha para a primeira pintura: LLD, seção "8. Cliente", "Tema".
 
 O `ThemeToggle` mostra a lua no tema claro e o sol no escuro.
 
@@ -529,10 +529,10 @@ Estes detalhes não aparecem só olhando o desenho:
 - **IconButton:** `label` é obrigatório e vira o tooltip e o `aria-label`. Ícone de 18 px; tons `default`, `sidebar` e `primary`; tamanhos 28 e 36.
 - **Tooltip:** atraso de 400 ms.
 - **CountBadge:** mostra `99+` acima de 99 e some em zero.
-- **PresenceDot:** cheia é disponível; anel vazado é ausente. No UserAvatar, a bolinha recorta o fundo (`Backdrop`: `sidebar`, `raised` ou `chrome`).
+- **PresenceDot:** cheia é disponível; anel vazado é ausente. No UserAvatar, a bolinha recorta o fundo (`Backdrop`: `sidebar`, `raised`, `chrome` ou `surface`, este no autor da Mensagem). No avatar, ela é decorativa: a Presença em texto fica no painel de perfil, no cabeçalho da Conversa direta e no menu do avatar.
 - **Avatar:** iniciais em `font-black` sobre `avatar-1` a `avatar-6`. Tamanhos xs 20, sm 24, md 36, lg 48 e xl 96; xs e sm usam `text-micro`.
 - **AgentAvatar:** o robô (`Bot`) distingue agentes de pessoas.
-- **Input:** `h-9`, borda `border-strong`. **Textarea:** `min-h-20`, `py-2`. **Field:** rótulo + controle + dica ou erro.
+- **Input:** `h-9`, borda `border-strong`, placeholder em `fg-muted`. **Textarea:** `min-h-20`, `py-2`. **Field:** rótulo + controle + dica ou erro.
 - **DropdownMenuItem:** `h-8`, destacado com `sidebar-active`. **DropdownMenuSeparator:** `my-2`, 1 px.
 - **Dialog:** largura máxima de 512, `rounded-card`, `shadow-3`, foco no primeiro campo.
 - **ConfirmDialog:** largura máxima de 448, foco em Cancelar, não fecha ao clicar fora (Radix AlertDialog).
@@ -550,7 +550,7 @@ Estes detalhes não aparecem só olhando o desenho:
 - **TaskItem:** concluída tem título riscado e botão Reabrir.
 - **SidebarRow:** `h-7`, `rounded-item`; não lida em `font-black`; ativa com `sidebar-active`. **SidebarSection:** recolhida, o chevron gira -90°.
 - **SidebarAction (Agentes):** muda com o papel: `connect` (admin, nenhum conectado), `add` (admin, parte conectada), `manage` (admin, todos conectados), `view` (não admin).
-- **ConversationHeader:** `h-header`; o tópico some abaixo de 640 px.
+- **ConversationHeader:** `h-header`; o tópico some abaixo de 640 px. A propriedade `Menu` mostra o IconButton "Abrir navegação" no começo, só abaixo de 768 px (`md:hidden`).
 - **ProfilePanel:** `w-panel`.
 
 ## Ícones
@@ -589,7 +589,7 @@ Os breakpoints são os padrões do Tailwind, e o Figma registra o que acontece e
 | Breakpoint | Comportamento abaixo dele |
 | --- | --- |
 | `xl` (1280) | O painel de perfil sobrepõe a conversa em vez de dividir o espaço |
-| `md` (768) | Rail e sidebar viram drawer; as linhas passam a 44 px |
+| `md` (768) | O Rail e a sidebar viram uma gaveta (Dialog do Radix, `NavigationDrawer`), e as linhas passam a 44 px. A gaveta abre pelo IconButton "Abrir navegação" (`icon/menu`), que fica no começo do ConversationHeader (propriedade `Menu` no Figma) e no topo da Home vazia. Ela fecha pelo Esc, pelo clique fora ou ao escolher um link. Frame: "Casca / Gaveta / Aberta" |
 | `sm` (640) | Painel de perfil em largura total; somem o tópico do cabeçalho e as dicas de teclado |
 
 `lg` (1024) e `2xl` (1536) não têm uso no produto. Escreva mobile-first com os prefixos do Tailwind (`md:`, `xl:`), sem media queries soltas no CSS.

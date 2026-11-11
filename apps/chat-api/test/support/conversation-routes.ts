@@ -42,6 +42,49 @@ export const conversationRoutes = {
       });
   },
 
+  // Pelo REST, como a web: abre a Conversa direta com a Pessoa (F05). Aceita qualquer corpo extra,
+  // para os testes da validação.
+  openDirect(
+    app: INestApplication,
+    cookie: string,
+    personId: string,
+    extra: Record<string, unknown> = {},
+  ): request.Test {
+    return request(app.getHttpServer() as App)
+      .post('/v1/conversations')
+      .set('Cookie', cookie)
+      .send({ kind: 'direct', person_id: personId, ...extra });
+  },
+
+  // Pelo REST, como a web: a Conversa como aparece na lista de quem tem o cookie (F07).
+  async listed<T extends { id: string }>(
+    app: INestApplication,
+    cookie: string,
+    conversationId: string,
+  ): Promise<T> {
+    const response = await request(app.getHttpServer() as App)
+      .get('/v1/conversations')
+      .set('Cookie', cookie)
+      .expect(200);
+    const found = (response.body as { conversations: T[] }).conversations.find(
+      (conversation) => conversation.id === conversationId,
+    );
+    if (!found) throw new Error('A Conversa não está na lista.');
+    return found;
+  },
+
+  // Pelo REST, como a web: abre a Conversa direta com a Pessoa. Devolve o id.
+  async directOf(
+    app: INestApplication,
+    cookie: string,
+    personId: string,
+  ): Promise<string> {
+    const response = await conversationRoutes
+      .openDirect(app, cookie, personId)
+      .expect(201);
+    return (response.body as { conversation: { id: string } }).conversation.id;
+  },
+
   // Pelo REST: um Canal privado só de quem o cria. Devolve o id.
   async privateChannelOf(
     app: INestApplication,
@@ -81,6 +124,46 @@ export const conversationRoutes = {
         client_id: options.clientId ?? randomUUID(),
         body: options.body ?? 'Chegou na hora',
       });
+  },
+
+  // Pelo REST, como a web: envia e devolve o id da Mensagem gravada.
+  async sentId(
+    app: INestApplication,
+    cookie: string,
+    conversationId: string,
+    body: string,
+  ): Promise<string> {
+    const response = await conversationRoutes
+      .sendMessage(app, cookie, conversationId, { body })
+      .expect(201);
+    return (response.body as { message: { id: string } }).message.id;
+  },
+
+  // Pelo REST, como a web: edita a Mensagem (spec da F06, "Rotas"). Aceita qualquer corpo, para os
+  // testes da validação.
+  editMessage(
+    app: INestApplication,
+    cookie: string,
+    conversationId: string,
+    messageId: string,
+    body: unknown,
+  ): request.Test {
+    return request(app.getHttpServer() as App)
+      .patch(`/v1/conversations/${conversationId}/messages/${messageId}`)
+      .set('Cookie', cookie)
+      .send({ body });
+  },
+
+  // Pelo REST, como a web: apaga a Mensagem (spec da F06, "Rotas").
+  deleteMessage(
+    app: INestApplication,
+    cookie: string,
+    conversationId: string,
+    messageId: string,
+  ): request.Test {
+    return request(app.getHttpServer() as App)
+      .delete(`/v1/conversations/${conversationId}/messages/${messageId}`)
+      .set('Cookie', cookie);
   },
 
   async removeMembership(

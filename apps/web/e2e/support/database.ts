@@ -1,4 +1,4 @@
-import { randomUUIDv7 } from "node:crypto";
+import { randomUUID, randomUUIDv7 } from "node:crypto";
 import { Pool } from "pg";
 import { TEST_PASSWORD, TEST_PASSWORD_HASH } from "./test-person";
 
@@ -10,17 +10,25 @@ export type TestPerson = {
   id: string;
   name: string;
   email: string;
+  username: string;
   password: string;
 };
 
-export async function insertPerson(name = "Ana Souza"): Promise<TestPerson> {
+export async function insertPerson(
+  name = "Ana Souza",
+  profile: { title?: string; phone?: string } = {},
+): Promise<TestPerson> {
   const id = randomUUIDv7();
   const email = `e2e-${randomUUIDv7()}@teste.local`;
+  // Aleatório de ponta a ponta: o começo do UUID v7 do e-mail é a hora, e o @usuário tem só 30
+  // caracteres (spec da F05, "Pessoas").
+  const username = `e2e-${randomUUID().replaceAll("-", "").slice(0, 24)}`;
   await pool.query(
-    "INSERT INTO people (id, email, name, password_hash) VALUES ($1, $2, $3, $4)",
-    [id, email, name, TEST_PASSWORD_HASH],
+    `INSERT INTO people (id, email, name, password_hash, username, title, phone)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [id, email, name, TEST_PASSWORD_HASH, username, profile.title ?? null, profile.phone ?? null],
   );
-  return { id, name, email, password: TEST_PASSWORD };
+  return { id, name, email, username, password: TEST_PASSWORD };
 }
 
 // Revoga todas as Sessões da Pessoa, como o comando de contas faria.
@@ -79,7 +87,7 @@ export type TestMessage = { id: string; body: string; createdAt: Date };
 // Mensagens direto no banco, em datas conhecidas e na ordem em que vêm.
 export async function insertMessages(
   channel: TestChannel,
-  messages: { author: TestPerson; body: string; at: Date }[],
+  messages: { author: TestPerson; body: string; at: Date; quotedMessageId?: string }[],
 ): Promise<TestMessage[]> {
   const inserted = messages.map((message) => ({
     id: uuidV7At(message.at.getTime()),
@@ -87,10 +95,10 @@ export async function insertMessages(
     createdAt: message.at,
   }));
   await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, client_id, body, created_at, updated_at)
-     SELECT id, $1, author_id, client_id, body, at, at
-     FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::text[], $6::timestamptz[])
-       AS rows(id, author_id, client_id, body, at)`,
+    `INSERT INTO messages (id, conversation_id, author_id, client_id, body, created_at, updated_at, quoted_message_id)
+     SELECT id, $1, author_id, client_id, body, at, at, quoted
+     FROM unnest($2::uuid[], $3::uuid[], $4::uuid[], $5::text[], $6::timestamptz[], $7::uuid[])
+       AS rows(id, author_id, client_id, body, at, quoted)`,
     [
       channel.id,
       inserted.map((message) => message.id),
@@ -98,6 +106,7 @@ export async function insertMessages(
       messages.map(() => randomUUIDv7()),
       messages.map((message) => message.body),
       messages.map((message) => message.at),
+      messages.map((message) => message.quotedMessageId ?? null),
     ],
   );
   return inserted;
@@ -150,4 +159,70 @@ export async function membersOfChannelNamed(name: string): Promise<string[]> {
     [name],
   );
   return result.rows.map((row) => row.person_id);
+}
+
+// O fuso gravado na Pessoa (F05-T03), ou null.
+export async function timeZoneOf(personId: string): Promise<string | null> {
+  const result = await pool.query<{ time_zone: string | null }>(
+    "SELECT time_zone FROM people WHERE id = $1",
+    [personId],
+  );
+  return result.rows[0]?.time_zone ?? null;
+}
+
+// Apaga a Mensagem direto no banco, sem o evento do tempo real: a tela ainda a mostra (F06).
+export async function softDeleteMessage(id: string): Promise<void> {
+  await pool.query(
+    "UPDATE messages SET body = NULL, deleted_at = now() WHERE id = $1",
+    [id],
+  );
+}
+
+// Conversa direta entre as duas Pessoas, com as duas participações, direto no banco (F05).
+export async function insertDirect(a: TestPerson, b: TestPerson): Promise<TestChannel> {
+  const id = randomUUIDv7();
+  const [low, high] = [a.id, b.id].sort();
+  await pool.query(
+    `INSERT INTO conversations (id, kind, direct_person_low_id, direct_person_high_id)
+     VALUES ($1, 'direct', $2, $3)`,
+    [id, low, high],
+  );
+  await pool.query(
+    `INSERT INTO conversation_members (id, conversation_id, person_id)
+     VALUES ($1, $3, $4), ($2, $3, $5)`,
+    [randomUUIDv7(), randomUUIDv7(), id, a.id, b.id],
+  );
+  return { id, name: "", topic: null };
+}
+
+// A Menção da Pessoa numa Mensagem já gravada, direto no banco (F06).
+export async function insertMention(messageId: string, person: TestPerson): Promise<void> {
+  await pool.query(
+    "INSERT INTO message_mentions (id, message_id, person_id) VALUES ($1, $2, $3)",
+    [randomUUIDv7(), messageId, person.id],
+  );
+}
+
+// A Última leitura da Pessoa na Conversa, direto no banco (F07).
+export async function setLastRead(
+  conversation: TestChannel,
+  person: TestPerson,
+  messageId: string | null,
+): Promise<void> {
+  await pool.query(
+    "UPDATE conversation_members SET last_read_message_id = $3 WHERE conversation_id = $1 AND person_id = $2",
+    [conversation.id, person.id, messageId],
+  );
+}
+
+// O tema gravado na Pessoa, direto no banco (F09-T05).
+export async function setThemeOf(personId: string, theme: "light" | "dark"): Promise<void> {
+  await pool.query("UPDATE people SET theme = $2 WHERE id = $1", [personId, theme]);
+}
+
+export async function themeOf(personId: string): Promise<string> {
+  const result = await pool.query<{ theme: string }>("SELECT theme FROM people WHERE id = $1", [
+    personId,
+  ]);
+  return result.rows[0].theme;
 }

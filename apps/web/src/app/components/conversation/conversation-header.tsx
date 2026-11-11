@@ -1,18 +1,46 @@
+import { OpenProfileButton } from "@/app/components/profile/open-profile-button";
+import {
+  PersonAvatar,
+  PersonName,
+  PersonPresenceDot,
+} from "@/app/components/people/person-display";
+import { UserStatus } from "@/app/components/people/user-status";
 import { OpenNavigationButton } from "@/app/components/workspace-nav/navigation-drawer";
-import type { ConversationKind } from "@/app/services/chat-api";
+import type { Conversation } from "@/app/services/chat-api";
 import { ChannelIcon } from "./channel-icon";
 
 type ConversationHeaderProps = {
-  name: string;
-  topic: string | null;
-  kind: ConversationKind;
+  conversation: Pick<Conversation, "kind" | "name" | "topic" | "counterpart">;
   // O botão de Membros, que a página põe quando tem a Conversa inteira.
   members?: React.ReactNode;
 };
 
 // Cabeçalho da Conversa (ConversationHeader): h-header; o Tópico some abaixo de 640 px, e o botão
-// da gaveta (Menu) só aparece abaixo de 768 px.
-export function ConversationHeader({ name, topic, kind, members }: ConversationHeaderProps) {
+// da gaveta (Menu) só aparece abaixo de 768 px. Na Conversa direta, o avatar e o nome da outra
+// Pessoa, que abrem o Perfil dela, sem Tópico nem Membros ("Conversa / Estrutura / Conversa
+// direta").
+export function ConversationHeader({ conversation, members }: ConversationHeaderProps) {
+  const { name, topic, kind, counterpart } = conversation;
+  if (kind === "direct" && counterpart) {
+    return (
+      <header className="flex h-header shrink-0 items-center gap-2 border-b border-border bg-surface pr-5 pl-2 md:pl-5">
+        <OpenNavigationButton />
+        <h1 className="flex min-w-0 items-center text-title font-black text-fg">
+          <OpenProfileButton
+            personId={counterpart.id}
+            className="flex min-w-0 items-center gap-2 hover:underline"
+          >
+            <PersonAvatar person={counterpart} size="sm" />
+            <span className="truncate">
+              <PersonName id={counterpart.id} name={counterpart.name} />
+            </span>
+          </OpenProfileButton>
+          <PersonPresenceDot personId={counterpart.id} className="ml-2" />
+          <UserStatus personId={counterpart.id} className="ml-2 text-body" />
+        </h1>
+      </header>
+    );
+  }
   return (
     <header className="flex h-header shrink-0 items-center gap-2 border-b border-border bg-surface pr-5 pl-2 md:pl-5">
       <OpenNavigationButton />

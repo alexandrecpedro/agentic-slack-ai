@@ -8,6 +8,9 @@ export type ErrorCode =
   | 'conversation_not_found'
   | 'channel_name_taken'
   | 'members_not_editable'
+  | 'message_not_found'
+  | 'message_not_owned'
+  | 'quoted_message_not_found'
   | 'not_found'
   | 'payload_too_large'
   | 'request_rejected'
@@ -23,6 +26,9 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   conversation_not_found: 404,
   channel_name_taken: 409,
   members_not_editable: 409,
+  message_not_found: 404,
+  message_not_owned: 403,
+  quoted_message_not_found: 404,
   not_found: 404,
   payload_too_large: 413,
   request_rejected: 400,

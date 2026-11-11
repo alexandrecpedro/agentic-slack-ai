@@ -24,6 +24,82 @@ export function appendToLatestPage(pages: MessagePage[], message: Message): Mess
   return [{ ...latest, messages: insertById(latest.messages, message) }, ...older];
 }
 
+// Uma edição é mais nova que a Mensagem que a tela tem quando o editedAt dela é posterior (spec da
+// F06, "Eventos no cliente"): uma edição atrasada, que chega depois de outra mais nova, não volta o
+// texto antigo.
+export function isNewerEdit(current: Message, edited: Message): boolean {
+  if (!edited.editedAt) return false;
+  return !current.editedAt || edited.editedAt > current.editedAt;
+}
+
+// A Mensagem editada no lugar da que está na lista, se ela estiver lá e a edição for mais nova; senão,
+// a mesma lista. Uma Mensagem que não está na lista não entra: a edição não traz Mensagens de volta.
+export function withEdit<T extends readonly Message[]>(messages: T, edited: Message): T | Message[] {
+  const index = messages.findIndex((message) => message.id === edited.id);
+  if (index < 0 || !isNewerEdit(messages[index], edited)) return messages;
+  return messages.with(index, edited);
+}
+
+// Troca, pelo id, a Mensagem editada no cache, só se a edição for mais nova.
+export function replaceEdited(pages: MessagePage[], edited: Message): MessagePage[] {
+  const index = pages.findIndex((page) => page.messages.some((message) => message.id === edited.id));
+  if (index < 0) return pages;
+  const messages = withEdit(pages[index].messages, edited);
+  if (messages === pages[index].messages) return pages;
+  return pages.with(index, { ...pages[index], messages });
+}
+
+// As Citações das Mensagens carregadas acompanham a original (spec da F06, "Eventos no cliente"): a
+// editada troca o texto, se a Citação não estiver apagada (uma edição atrasada já foi descartada por
+// quem chama); a apagada vira a marca de apagada.
+export function patchQuotes(
+  pages: MessagePage[],
+  original: { id: string; edited?: Message; deleted?: boolean },
+): MessagePage[] {
+  let changed = false;
+  const next = pages.map((page) => {
+    let pageChanged = false;
+    const messages = page.messages.map((message) => {
+      const quote = message.quote;
+      if (!quote || quote.id !== original.id || quote.deleted) return message;
+      if (original.deleted) {
+        pageChanged = true;
+        return { ...message, quote: { id: quote.id, deleted: true as const } };
+      }
+      const edited = original.edited;
+      if (!edited || edited.body === quote.body) return message;
+      pageChanged = true;
+      return { ...message, quote: { ...quote, body: edited.body } };
+    });
+    if (!pageChanged) return page;
+    changed = true;
+    return { ...page, messages };
+  });
+  return changed ? next : pages;
+}
+
+// A última edição vista de cada Mensagem, pelo editedAt: decide se uma edição que chega é nova
+// também para as Citações, cuja original pode não estar carregada. Devolve se a edição é nova, e a
+// guarda quando é.
+export function recordEdit(versions: Map<string, string>, edited: Message): boolean {
+  if (!edited.editedAt) return false;
+  const seen = versions.get(edited.id);
+  if (seen && edited.editedAt <= seen) return false;
+  versions.set(edited.id, edited.editedAt);
+  return true;
+}
+
+// Tira a Mensagem apagada do cache, pelo id (spec da F06, "Eventos no cliente").
+export function removeDeleted(pages: MessagePage[], messageId: string): MessagePage[] {
+  const index = pages.findIndex((page) => page.messages.some((message) => message.id === messageId));
+  if (index < 0) return pages;
+  const page = pages[index];
+  return pages.with(index, {
+    ...page,
+    messages: page.messages.filter((message) => message.id !== messageId),
+  });
+}
+
 // Encaixa a Mensagem na ordem do id (UUID v7, a ordem da Conversa). Quem chama já descartou o id
 // repetido.
 export function insertById(messages: readonly Message[], message: Message): Message[] {

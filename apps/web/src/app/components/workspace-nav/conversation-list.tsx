@@ -1,0 +1,121 @@
+"use client";
+
+import { useEffect } from "react";
+import { useIsOpenAndFocused } from "@/app/hooks/use-is-open-and-focused";
+import useSWR from "swr";
+import { useRealtime } from "@/app/components/realtime/realtime-provider";
+import type { Conversation } from "@/app/services/chat-api";
+import { fetchConversationList } from "@/app/services/conversation-list";
+import {
+  applyMemberAdded,
+  applyUnread,
+  conversationHref,
+  conversationsKey,
+} from "@/app/utils/conversation-list";
+import { unreadDisplay } from "@/app/utils/unread";
+import { AddChannelAction } from "./add-channel-action";
+import { NewConversationAction } from "./new-conversation-action";
+import { SidebarRow } from "./sidebar-row";
+import { SidebarSection } from "./sidebar-section";
+
+export { conversationsKey };
+
+
+
+type ConversationListProps = {
+  // A lista lida pelo Server Component, ponto de partida do cache.
+  initialConversations: readonly Conversation[];
+  // A Pessoa da Sessão: o evento põe a Conversa na lista só de quem acabou de entrar nela.
+  personId: string;
+};
+
+// As seções "Canais" e "Mensagens diretas" no cliente (spec da F04, "Lista de Conversas no
+// cliente"; spec da F05): o conversation.member_added muda o cache sem nova requisição, e o reset
+// do tempo real busca a lista de novo. Uma falha nessa busca mantém a lista que já está na tela.
+export function ConversationList({ initialConversations, personId }: ConversationListProps) {
+  const { data: conversations, mutate } = useSWR(conversationsKey(personId), fetchConversationList, {
+    fallbackData: initialConversations,
+    revalidateOnMount: false,
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+  });
+  const { subscribe } = useRealtime();
+  // A Conversa aberta com a aba em foco não mostra nada de novo (spec da F07).
+  const isOpenAndFocused = useIsOpenAndFocused();
+
+  // Uma lista nova do servidor (a revalidação do layout depois de criar um Canal) vale mais que a
+  // do cache, que o fallbackData não substitui depois do primeiro mutate.
+  useEffect(() => {
+    void mutate(initialConversations, { revalidate: false });
+  }, [initialConversations, mutate]);
+
+  useEffect(
+    () =>
+      subscribe({
+        onMemberAdded: ({ conversation, personIds }) => {
+          // Quem acabou de entrar busca a lista de novo, para trazer a Última leitura e os números
+          // da Conversa nova, que o evento não leva (spec da F07, "Rotas"). É raro.
+          const hasJoined = personIds.includes(personId);
+          void mutate(
+            (current) =>
+              applyMemberAdded(current ?? initialConversations, conversation, personIds, personId),
+            { revalidate: hasJoined },
+          );
+        },
+        // Os números calculados pelo servidor (spec da F07, "Tempo real"); a Última leitura anterior
+        // à do cache é descartada.
+        onUnread: ({ conversationId, unread }) => {
+          void mutate(
+            (current) => applyUnread(current ?? initialConversations, conversationId, unread),
+            { revalidate: false },
+          );
+        },
+        onSync: (event) => {
+          if (event.reset) void mutate();
+        },
+        replayLastReset: true,
+      }),
+    [subscribe, mutate, initialConversations, personId],
+  );
+
+  const channels = conversations.filter((conversation) => conversation.kind !== "direct");
+  const directs = conversations.filter((conversation) => conversation.kind === "direct");
+  const row = (conversation: Conversation) => (
+    <SidebarRow
+      key={conversation.id}
+      href={conversationHref(conversation)}
+      conversation={conversation}
+      selfId={personId}
+      isOpenAndFocused={isOpenAndFocused(conversation)}
+    />
+  );
+  // Recolhida, a seção mostra só as Conversas Não lidas (spec da F07, "Lista de Conversas e barra
+  // lateral").
+  const rows = (list: Conversation[], isExpanded: boolean) =>
+    list
+      .filter(
+        (conversation) =>
+          isExpanded || unreadDisplay(conversation, isOpenAndFocused(conversation)).isUnread,
+      )
+      .map(row);
+  return (
+    <>
+      <SidebarSection title="Canais">
+        {(isExpanded) => (
+          <>
+            {rows(channels, isExpanded)}
+            {isExpanded && <AddChannelAction />}
+          </>
+        )}
+      </SidebarSection>
+      <SidebarSection title="Mensagens diretas">
+        {(isExpanded) => (
+          <>
+            {rows(directs, isExpanded)}
+            {isExpanded && <NewConversationAction personId={personId} />}
+          </>
+        )}
+      </SidebarSection>
+    </>
+  );
+}

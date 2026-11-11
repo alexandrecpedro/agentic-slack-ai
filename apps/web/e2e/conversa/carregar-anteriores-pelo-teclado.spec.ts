@@ -12,6 +12,9 @@ test.describe("Histórico até a primeira Mensagem", () => {
     loggedInPage,
   }) => {
     void loggedInPage;
+    // Centenas de Shift+Tab pela lista: sozinho leva uns 15 s, e com a suíte em paralelo passa dos
+    // 30 s do padrão.
+    test.slow();
     // Sem o IntersectionObserver, só o teclado pede as anteriores: focar o link o rolaria para a
     // tela, e o sentinela carregaria sozinho.
     await page.addInitScript(() => {
@@ -32,9 +35,19 @@ test.describe("Histórico até a primeira Mensagem", () => {
     const caixa = page.getByRole("textbox", { name: `Mensagem para #${channel.name}` });
     await expect(caixa).toBeFocused();
 
-    // 2. A área de rolagem recebe o foco e rola pelas teclas
-    await page.keyboard.press("Shift+Tab");
+    // 2. A área de rolagem recebe o foco e rola pelas teclas. Entre a caixa e o botão ficam os
+    // controles de cada Mensagem: o nome da autora, que abre o Perfil (F05), e a barra de ações
+    // (F06). Toda parada no caminho é um controle de dentro da lista de Mensagens.
     const botao = page.getByRole("button", { name: "Carregar mensagens anteriores" });
+    const focoNoBotao = () => botao.evaluate((element) => element === document.activeElement);
+    for (let paradas = 0; !(await focoNoBotao()); paradas += 1) {
+      expect(paradas).toBeLessThan(400);
+      await page.keyboard.press("Shift+Tab");
+      if (await focoNoBotao()) break;
+      expect(
+        await mensagens.evaluate((lista) => lista.contains(document.activeElement)),
+      ).toBe(true);
+    }
     await expect(botao).toBeFocused();
     await page.keyboard.press("Shift+Tab");
     await expect(historico).toBeFocused();
