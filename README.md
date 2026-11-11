@@ -98,7 +98,6 @@ O diagrama completo, os fluxos e as decisões estão no [HLD](docs/hld.md).
 │   ├── hld.md            # High-Level Design (Arquitetura)
 │   ├── lld.md            # Low-Level Design (Modelagem e Rotas)
 │   ├── adr/              # Architecture Decision Records
-│   └── class01.md        # Documentação detalhada da Aula 01
 ├── docker/               # Scripts de inicialização do banco de dados e serviços
 ├── compose.yaml          # Orquestração do ambiente completo via Docker Compose
 └── AGENTS.md             # Guia de comandos e padrões para desenvolvedores e IAs
