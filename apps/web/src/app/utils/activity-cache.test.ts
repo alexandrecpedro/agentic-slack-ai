@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ActivityItem, ActivityPage, Message } from "@/app/services/chat-api";
+import type { ActivityPage, Message, MessageActivityItem } from "@/app/services/chat-api";
+import { activityItemId } from "./activity";
 import { applyCreated, applyDeleted, applyUpdated, notificationKindFor } from "./activity-cache";
 
 const ME = "me";
@@ -9,17 +10,21 @@ function message(id: string, overrides: Partial<Message> = {}): Message {
     id,
     conversationId: "c",
     clientId: id,
-    author: { id: "other", name: "Ana", initials: "AN" },
+    author: { kind: "person", id: "other", name: "Ana", username: "pessoa", initials: "AN" },
     body: `Mensagem ${id}`,
     createdAt: "2026-11-10T12:00:00.000Z",
     editedAt: null,
     mentions: [],
     quote: null,
+    quickReplies: null,
+    businessData: false,
+    blocked: false,
+    report: null,
     ...overrides,
   };
 }
 
-function item(id: string, kind: ActivityItem["kind"] = "mention"): ActivityItem {
+function item(id: string, kind: MessageActivityItem["kind"] = "mention"): MessageActivityItem {
   return {
     kind,
     message: message(id),
@@ -38,7 +43,7 @@ function item(id: string, kind: ActivityItem["kind"] = "mention"): ActivityItem 
 }
 
 function ids(pages: ActivityPage[]): string[][] {
-  return pages.map((page) => page.items.map((entry) => entry.message.id));
+  return pages.map((page) => page.items.map(activityItemId));
 }
 
 describe("Atividade no cache", () => {
@@ -47,9 +52,19 @@ describe("Atividade no cache", () => {
     expect(notificationKindFor(mentioning, { kind: "public_channel" }, ME)).toBe("mention");
     expect(notificationKindFor(message("2"), { kind: "private_channel" }, ME)).toBeNull();
     expect(notificationKindFor(message("3"), { kind: "direct" }, ME)).toBe("direct");
-    const own = message("4", { author: { id: ME, name: "Eu", initials: "EU" } });
+    const own = message("4", { author: { kind: "person", id: ME, name: "Eu", username: "pessoa", initials: "EU" } });
     expect(notificationKindFor(own, { kind: "direct" }, ME)).toBeNull();
     expect(notificationKindFor(mentioning, undefined, ME)).toBeNull();
+  });
+
+  it("a Mensagem de bot só é Notificação quando menciona a Pessoa num Canal", () => {
+    const bot = { kind: "bot" as const, id: "bot", name: "Assistente", username: "assistente", initials: "AS" };
+    const mentioning = message("5", { author: bot, mentions: [{ id: ME, username: "eu" }] });
+    const silent = message("6", { author: bot });
+
+    expect(notificationKindFor(mentioning, { kind: "public_channel" }, ME)).toBe("mention");
+    expect(notificationKindFor(mentioning, { kind: "direct" }, ME)).toBeNull();
+    expect(notificationKindFor(silent, { kind: "public_channel" }, ME)).toBeNull();
   });
 
   it("a nova entra no topo da aba do tipo dela", () => {
@@ -68,7 +83,8 @@ describe("Atividade no cache", () => {
     ];
     const edited = message("7", { body: "Editada" });
 
-    expect(applyUpdated(pages, edited, { ...item("7"), message: edited }, "all")[0].items[1].message.body).toBe(
+    const updated = applyUpdated(pages, edited, { ...item("7"), message: edited }, "all")[0].items[1];
+    expect(updated.kind !== "task" && updated.message.body).toBe(
       "Editada",
     );
     expect(ids(applyUpdated(pages, message("7"), null, "all"))).toEqual([["5"], ["2", "3"]]);

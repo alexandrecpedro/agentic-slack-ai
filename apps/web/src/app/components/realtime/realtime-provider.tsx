@@ -15,10 +15,12 @@ import type {
   StoredEvent,
   StoredEventName,
   SyncEvent,
+  TaskEvent,
+  TaskNotificationPayload,
 } from "chat-events";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
-import type { ActivityUnread, Conversation, Message, Unread } from "@/app/services/chat-api";
+import type { ActivityUnread, Conversation, Message, Task, Unread } from "@/app/services/chat-api";
 import { activityUnreadFromPayload } from "@/app/utils/activity-unread";
 import { conversationFromPayload, unreadFromPayload } from "@/app/utils/conversation-event";
 import { laterCursor, orderForSync } from "@/app/utils/event-cursor";
@@ -26,6 +28,7 @@ import { messageFromEvent } from "@/app/utils/message-event";
 import { forgetMessage, rememberEdit, rememberMessage } from "@/app/utils/recent-messages";
 import { clearLeaving, hasAskedToLeave } from "@/app/utils/leaving";
 import { redirectToExpiredSession } from "@/app/utils/return-path";
+import { taskFromPayload } from "@/app/utils/tasks";
 
 export type RealtimeSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
@@ -53,12 +56,17 @@ export type RealtimeListener = {
   onUnread?: (event: ConversationUnread) => void;
   // Os números de Atividade, calculados pelo servidor (spec da F08, "Tempo real").
   onActivityUnread?: (unread: ActivityUnread) => void;
+  // A Tarefa criada ou que mudou de estado (`task.created` e `task.updated`), para o Responsável e
+  // quem delegou (spec da F12, "Eventos"). O reenvio da reconexão não alerta.
+  onTask?: (task: Task, arrival: MessageArrival, notification: TaskNotificationPayload | null) => void;
   onSync?: (event: SyncEvent) => void;
   // O Perfil que mudou, para todo o workspace, sem guardar nem reenviar (spec da F09, "Tempo real").
   // Assinado aqui, e não direto no socket, para não perder o que chega logo depois da conexão.
   onPersonUpdated?: (event: PersonUpdatedEvent) => void;
   // A Presença que mudou, para todo o workspace, sem guardar (spec da F09, "Tempo real").
   onPresenceChanged?: (event: PresenceChangedEvent) => void;
+  // O registro de Agentes mudou: releia a lista (spec da F10, "Evento agents.changed").
+  onAgentsChanged?: () => void;
   // Quem assina depois do sync recebe, por padrão, uma cópia sem reset. Com esta marca, recebe o
   // reset do último sync: é o caso de quem não guarda os eventos que perdeu, como a lista de
   // Conversas da barra lateral.
@@ -189,6 +197,9 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
     socket.on("person.updated", (event) => {
       listeners.current.forEach((listener) => listener.onPersonUpdated?.(event));
     });
+    socket.on("agents.changed", () => {
+      listeners.current.forEach((listener) => listener.onAgentsChanged?.());
+    });
     socket.on("presence.changed", (event) => {
       listeners.current.forEach((listener) => listener.onPresenceChanged?.(event));
     });
@@ -245,6 +256,11 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
       const unread = activityUnreadFromPayload(event);
       listeners.current.forEach((listener) => listener.onActivityUnread?.(unread));
     };
+    const applyTask = (event: TaskEvent) => {
+      const task = taskFromPayload(event.task);
+      const arrival = { isReplay: isReplaying };
+      listeners.current.forEach((listener) => listener.onTask?.(task, arrival, event.notification ?? null));
+    };
     // Uma entrada por evento guardado: um evento novo no contrato não compila até ter a sua.
     const handlers: StoredEventHandlers = {
       "message.created": applyMessage,
@@ -253,6 +269,8 @@ export function RealtimeProvider({ url, children }: RealtimeProviderProps) {
       "conversation.member_added": applyMemberAdded,
       "conversation.unread": applyUnread,
       "activity.unread": applyActivityUnread,
+      "task.created": applyTask,
+      "task.updated": applyTask,
     };
     // Os eventos guardados por Pessoa, na ordem do cursor: aplica e avança o cursor.
     const apply = ({ name, event }: ReceivedEvent) => {

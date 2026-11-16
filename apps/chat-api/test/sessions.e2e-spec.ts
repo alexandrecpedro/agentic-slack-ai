@@ -5,6 +5,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { DataSource } from 'typeorm';
 import { agingRoutes, daysAgo } from './support/aging-routes';
+import { PeopleService } from '../src/people/people.service';
 import { authRoutes } from './support/auth-routes';
 import { createTestApp } from './support/create-test-app';
 import { uniqueEmail } from './support/unique-email';
@@ -54,6 +55,8 @@ describe('sessões', () => {
         status: null,
         presence_choice: 'available',
         theme: 'light',
+        is_admin: false,
+        data_access: false,
       });
       const rows = await app
         .get(DataSource)
@@ -141,8 +144,36 @@ describe('sessões', () => {
           status: null,
           presence_choice: 'available',
           theme: 'light',
+          is_admin: false,
+          data_access: false,
         },
       });
+    });
+
+    it('traz is_admin lido do banco a cada requisição', async () => {
+      const { person, email, password } = await authRoutes.createPerson(app);
+      const token = await authRoutes.login(app, email, password);
+      await app.get(PeopleService).setAdmin(person.id, true);
+
+      const response = await request(server)
+        .get('/v1/sessions/current')
+        .set('Cookie', authRoutes.sessionCookie(token));
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ person: { is_admin: true } });
+    });
+
+    it('traz data_access lido do banco a cada requisição', async () => {
+      const { person, email, password } = await authRoutes.createPerson(app);
+      const token = await authRoutes.login(app, email, password);
+      await app.get(PeopleService).setDataAccess(person.id, true);
+
+      const response = await request(server)
+        .get('/v1/sessions/current')
+        .set('Cookie', authRoutes.sessionCookie(token));
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ person: { data_access: true } });
     });
 
     it('responde 401 unauthenticated sem cookie', async () => {

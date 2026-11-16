@@ -10,7 +10,10 @@ import { parseUsername } from '../people/username';
 import { PersonNotFoundError } from '../people/person-not-found.error';
 import { Person } from '../people/person.entity';
 import { SessionsService } from '../sessions/sessions.service';
+import { BotsService } from '../bots/bots.service';
 import { PasswordPrompt } from './password-prompt';
+import { UsernameAvailability } from './username-availability';
+import { UsernameUnavailableError } from './username-unavailable.error';
 
 const USAGE = `Uso: pnpm accounts <operação> [argumentos]
 
@@ -21,18 +24,29 @@ Operações:
                              Troca o cargo e o telefone; o valor vazio ("") apaga
   reset-password <e-mail>    Troca a senha (lida do terminal) e revoga todas as Sessões
   revoke-sessions <e-mail>   Apaga todas as Sessões da Pessoa
+  set-admin <e-mail|@usuário> on|off
+                             Dá ou tira o papel de administrador
+  set-data-access <e-mail|@usuário> on|off
+                             Liga ou desliga a Permissão de dados
+  create-bot <@usuário> <nome>
+                             Cria o bot de um Agente, que reserva o @usuário dele
   purge-expired-sessions     Apaga as Sessões vencidas`;
 
 // Comando de contas de quem opera a instalação (spec da F01, "Comando de contas").
 // Devolve o código de saída do processo.
 export class AccountsCommand implements Command {
+  private readonly usernames: UsernameAvailability;
+
   constructor(
     private readonly people: PeopleService,
     private readonly conversations: ConversationsService,
     private readonly sessions: SessionsService,
+    private readonly bots: BotsService,
     private readonly prompt: PasswordPrompt,
     private readonly output: CommandOutput,
-  ) {}
+  ) {
+    this.usernames = new UsernameAvailability(people, bots);
+  }
 
   async run(args: string[]): Promise<number> {
     const [operation, ...rest] = args;
@@ -46,6 +60,12 @@ export class AccountsCommand implements Command {
           return await this.resetPassword(rest);
         case 'revoke-sessions':
           return await this.revokeSessions(rest);
+        case 'set-admin':
+          return await this.setAdmin(rest);
+        case 'set-data-access':
+          return await this.setDataAccess(rest);
+        case 'create-bot':
+          return await this.createBot(rest);
         case 'purge-expired-sessions':
           return await this.purgeExpiredSessions();
         default:
@@ -82,7 +102,9 @@ export class AccountsCommand implements Command {
     }
     // Antes da senha: um valor fora da regra não faz quem opera digitá-la à toa.
     const { username, title, phone } = parsed.options;
-    if (username !== undefined) parseUsername(username);
+    if (username !== undefined) {
+      await this.assertUsernameFree(parseUsername(username));
+    }
     if (title !== undefined) parseTitle(title);
     if (phone !== undefined) parsePhone(phone);
     const password = await this.askNewPassword('Senha: ');
@@ -93,6 +115,8 @@ export class AccountsCommand implements Command {
       name,
       password,
       ...parsed.options,
+      // O @usuário derivado do e-mail também não pode ser o de um bot.
+      isUsernameFree: (candidate) => this.usernames.isFree(candidate),
     });
     this.output.info(
       `Pessoa criada: ${person.email} (@${person.username}, ${person.id}).`,
@@ -146,6 +170,103 @@ export class AccountsCommand implements Command {
     const revoked = await this.sessions.revokeAll(person.id);
     this.output.info(`${revoked} Sessão(ões) revogada(s) de ${person.email}.`);
     return 0;
+  }
+
+  // Dá ou tira o papel de administrador (spec da F10, "Comando de contas"). Não publica evento: a
+  // mudança aparece na próxima carga da página e na próxima abertura do Perfil.
+  private setAdmin(args: string[]): Promise<number> {
+    return this.setFlag(
+      args,
+      'set-admin',
+      (personId, value) => this.people.setAdmin(personId, value),
+      {
+        on: 'agora é administrador(a)',
+        off: 'deixou de ser administrador(a)',
+        alreadyOn: 'já era administrador(a)',
+        alreadyOff: 'já não era administrador(a)',
+      },
+    );
+  }
+
+  // Liga ou desliga a Permissão de dados (spec da F13, "Permissão de dados"). Não publica evento: a
+  // mudança vale no próximo Pedido e na próxima leitura de cada Mensagem.
+  private setDataAccess(args: string[]): Promise<number> {
+    return this.setFlag(
+      args,
+      'set-data-access',
+      (personId, value) => this.people.setDataAccess(personId, value),
+      {
+        on: 'agora tem Permissão de dados',
+        off: 'deixou de ter Permissão de dados',
+        alreadyOn: 'já tinha Permissão de dados',
+        alreadyOff: 'já não tinha Permissão de dados',
+      },
+    );
+  }
+
+  // Uma operação `<e-mail|@usuário> on|off`: grava só se mudar e diz o que aconteceu, depois do nome.
+  private async setFlag(
+    args: string[],
+    operation: string,
+    set: (personId: string, value: boolean) => Promise<boolean>,
+    results: Record<'on' | 'off' | 'alreadyOn' | 'alreadyOff', string>,
+  ): Promise<number> {
+    const [identifier, value] = args;
+    if (
+      args.length !== 2 ||
+      !identifier.trim() ||
+      !['on', 'off'].includes(value)
+    ) {
+      this.output.error(
+        `Uso: pnpm accounts ${operation} <e-mail|@usuário> on|off`,
+      );
+      return 1;
+    }
+    const person = await this.findByEmailOrUsername(identifier.trim());
+    const on = value === 'on';
+    const changed = await set(person.id, on);
+    const result = changed
+      ? on
+        ? results.on
+        : results.off
+      : on
+        ? results.alreadyOn
+        : results.alreadyOff;
+    this.output.info(`${person.name} ${result}.`);
+    return 0;
+  }
+
+  // Cria o bot de um Agente (spec da F10, "Comando de contas"), com o @usuário livre nas Pessoas e
+  // nos bots. O `@` do começo é aceito e ignorado.
+  private async createBot(args: string[]): Promise<number> {
+    const [informed, name] = args;
+    if (args.length !== 2 || !informed.trim()) {
+      this.output.error('Uso: pnpm accounts create-bot <@usuário> <nome>');
+      return 1;
+    }
+    const username = parseUsername(informed.trim().replace(/^@/, ''));
+    await this.assertUsernameFree(username);
+    const bot = await this.bots.create({ username, name });
+    this.output.info(`Bot criado: @${bot.username} (${bot.name}, ${bot.id}).`);
+    return 0;
+  }
+
+  private async assertUsernameFree(username: string): Promise<void> {
+    const owner = await this.usernames.ownerOf(username);
+    if (owner) throw new UsernameUnavailableError(username, owner);
+  }
+
+  // Um argumento que começa com `@` é o @usuário; o resto é o e-mail.
+  private async findByEmailOrUsername(identifier: string): Promise<Person> {
+    if (identifier.startsWith('@')) {
+      const username = identifier.slice(1);
+      const person = await this.people.findByUsername(username);
+      if (!person) throw new PersonNotFoundError(null, username);
+      return person;
+    }
+    const person = await this.people.findByEmail(identifier);
+    if (!person) throw new PersonNotFoundError(normalizeEmail(identifier));
+    return person;
   }
 
   private async purgeExpiredSessions(): Promise<number> {

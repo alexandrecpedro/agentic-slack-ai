@@ -1,14 +1,5 @@
 import type { Presence } from 'chat-events';
-import {
-  Check,
-  Column,
-  Entity,
-  Index,
-  JoinColumn,
-  ManyToOne,
-  type Relation,
-} from 'typeorm';
-import { Message } from '../messages/message.entity';
+import { Check, Column, Entity, Index } from 'typeorm';
 import { BaseEntity } from '../database/base.entity';
 import {
   NAME_MAX_LENGTH,
@@ -92,18 +83,24 @@ export class Person extends BaseEntity {
   @Column({ type: 'text', default: 'light' })
   theme!: Theme;
 
+  // O papel de administrador (spec da F10, "Papel de administrador"), dado e tirado pelo comando de
+  // contas e lido do banco a cada requisição.
+  @Column({ type: 'boolean', default: false })
+  isAdmin!: boolean;
+
+  // A Permissão de dados (spec da F13, "Permissão de dados"), ligada e desligada pelo comando de
+  // contas e lida do banco a cada requisição. O BFF a envia no Pedido (ADR 0015).
+  @Column({ type: 'boolean', default: false })
+  dataAccess!: boolean;
+
   // Fuso IANA do navegador da Pessoa, gravado por ela (F05-T03).
   @Column({ type: 'text', nullable: true })
   timeZone!: string | null;
 
-  // A marca de Atividade: até que Mensagem as Notificações estão lidas por "Marcar tudo como lido"
-  // (spec da F08, "Notificações e contagem"). Só avança. A exclusão de Mensagem é lógica, então a
-  // referência não tem ação de cascata.
+  // A marca de Atividade: até onde as Notificações estão lidas por "Marcar tudo como lido" (spec da
+  // F08, "Notificações e contagem"). Só avança.
+  // É uma posição, e não uma referência: o id (UUID v7) da Mensagem ou da Notificação de Tarefa mais
+  // nova vista, comparável entre as fontes (ADR 0029), por isso sem chave estrangeira.
   @Column({ type: 'uuid', nullable: true })
   activityReadMessageId!: string | null;
-
-  @ManyToOne(() => Message)
-  @JoinColumn({ name: 'activity_read_message_id' })
-  // Relation: Message também importa Person, e o tipo não pode depender da ordem de carga.
-  activityReadMessage?: Relation<Message>;
 }

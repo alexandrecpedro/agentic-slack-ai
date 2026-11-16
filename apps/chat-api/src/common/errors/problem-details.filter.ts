@@ -23,10 +23,23 @@ const DETAILS: Record<ErrorCode, string> = {
   members_not_editable: 'Só é possível adicionar pessoas a um canal privado.',
   message_not_found: 'Mensagem não encontrada.',
   message_not_owned: 'Só quem escreveu a Mensagem pode mudá-la.',
+  forbidden: 'Só administradores podem fazer isso.',
   quoted_message_not_found: 'A Mensagem citada não existe nesta Conversa.',
   not_found: 'Recurso não encontrado.',
   payload_too_large: 'O corpo da requisição é grande demais.',
   request_rejected: 'A requisição foi recusada.',
+  bot_not_found: 'Não há bot com esse @usuário.',
+  invalid_bot_token: 'Credencial de bot ausente ou inválida.',
+  request_not_found: 'Pedido não encontrado.',
+  request_closed: 'O Pedido já foi encerrado.',
+  request_expired: 'O Pedido venceu.',
+  report_not_started: 'O Relatório não foi iniciado.',
+  data_access_required: 'Você não tem permissão para ver dados de negócio.',
+  assignee_not_member:
+    'O Responsável precisa ser Membro da Conversa do Pedido.',
+  assignee_is_bot: 'Uma Tarefa não pode ser delegada a um Agente.',
+  task_not_found: 'Tarefa não encontrada.',
+  task_not_assignee: 'Só o Responsável conclui e reabre a Tarefa.',
   internal_error: 'Erro interno. Tente novamente mais tarde.',
 };
 

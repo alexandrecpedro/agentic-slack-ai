@@ -1,0 +1,117 @@
+"""A pergunta pelo Recorte, que a ferramenta `perguntar_recorte` faz (spec da F11, "O Agente
+`assistente`").
+
+O código calcula os Recortes pelo fuso e pelo instante do Pedido, pede as contagens de uma vez e
+monta os rótulos das Respostas prontas com elas: o modelo não calcula data, contagem nem botão. As
+contagens vêm da API do chat em produção e da fixture na avaliação (`app/eval_fixtures.py`).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
+
+from google.adk.tools import ToolContext
+
+from app.agent_requests import context
+from app.agent_requests.reading import request_clock
+from app.agent_requests.recorte import recorte_interval
+
+# O texto da pergunta, como no Figma (Conversa / Mensagem / Pergunta do agente).
+QUESTION_BODY = (
+    "De que período você quer o resumo? Você pode responder sem me mencionar."
+)
+# O rótulo de cada Recorte com início, na ordem dos botões; "Tudo" é o total, sem início. O
+# modelo reconhece a resposta pelo começo do rótulo.
+COUNTED_RECORTES = (
+    ("hoje", "Hoje"),
+    ("desde_ontem", "Desde ontem"),
+    ("semana", "A semana"),
+)
+ALL_LABEL = "Tudo"
+# Os limites das Respostas prontas na API do chat (spec da F11, "Rotas do bot e credencial").
+MAX_QUICK_REPLIES = 4
+MAX_QUICK_REPLY_LENGTH = 64
+# A recusa de perguntar numa continuação, que já responde a uma pergunta (spec da F11).
+NAO_PERGUNTE = "Esta Mensagem já responde a uma pergunta; não pergunte de novo."
+
+
+@dataclass(frozen=True)
+class CountWindow:
+    # O início de cada Recorte com início, na ordem de COUNTED_RECORTES.
+    sinces: list[datetime]
+    # O instante do Pedido, exclusivo, como na leitura.
+    until: datetime
+
+
+class MessageCounter(Protocol):
+    async def count(self, sinces: list[datetime], until: datetime) -> dict[str, Any]:
+        """`{"counts": [{since, count}], "total": N}`, como a rota de contagens do bot."""
+        ...
+
+
+def count_window(state: Mapping[str, Any]) -> CountWindow:
+    """Os inícios dos Recortes e o fim, pelo fuso e pelo instante do Pedido no estado."""
+    time_zone, requested_at = request_clock(state)
+    intervals = [
+        recorte_interval(recorte, time_zone, requested_at)
+        for recorte, _ in COUNTED_RECORTES
+    ]
+    sinces: list[datetime] = []
+    for interval in intervals:
+        # Todo Recorte contado tem início; sem ele, a contagem e o rótulo se desalinhariam.
+        if interval.since is None:
+            raise ValueError("Recorte contado sem início")
+        sinces.append(interval.since)
+    return CountWindow(sinces=sinces, until=intervals[0].until)
+
+
+def quick_reply_labels(counts: list[int], total: int) -> list[str]:
+    """ "Hoje (N)", "Desde ontem (N)", "A semana (N)" e "Tudo (N)", com as contagens na ordem."""
+    labels = [
+        f"{label} ({count})"
+        for (_, label), count in zip(COUNTED_RECORTES, counts, strict=True)
+    ]
+    return [*labels, f"{ALL_LABEL} ({total})"]
+
+
+async def recorte_options(
+    counter: MessageCounter, state: Mapping[str, Any]
+) -> list[str]:
+    """Os rótulos das Respostas prontas, com as contagens de agora."""
+    window = count_window(state)
+    result = await counter.count(window.sinces, window.until)
+    return quick_reply_labels(
+        [item["count"] for item in result["counts"]], result["total"]
+    )
+
+
+def question_asked(tool_context: ToolContext, options: list[str]) -> dict[str, Any]:
+    """Marca que este Pedido perguntou (`context.mark_answered`)."""
+    context.mark_answered(tool_context, "question")
+    return {"pergunta": QUESTION_BODY, "opcoes": options}
+
+
+async def ask_question(
+    client: Any,
+    tool_context: ToolContext,
+    body: str,
+    labels: list[str],
+    *,
+    business_data: bool = False,
+) -> dict[str, Any]:
+    """Grava a pergunta do bot com as Respostas prontas e marca que este Pedido perguntou: o fim do
+    Pedido não grava `reply` (F11-T07; a pergunta de nome e a de período da F13). Numa continuação,
+    que já responde a uma pergunta, não pergunta de novo e devolve o `erro`."""
+    if tool_context.state.get(context.KIND) == "continuation":
+        return {"erro": NAO_PERGUNTE}
+    await client.question(
+        tool_context.state[context.REQUEST_ID],
+        body,
+        labels,
+        business_data=business_data,
+    )
+    context.mark_answered(tool_context, "question")
+    return {"pergunta": body, "opcoes": labels}

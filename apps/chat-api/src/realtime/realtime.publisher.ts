@@ -2,13 +2,23 @@ import { Injectable, Logger } from '@nestjs/common';
 import type {
   ConversationPayload,
   PersonUpdatedEvent,
+  MessageAuthorPayload,
   MessagePayload,
   StoredEventName,
   StoredEventPayloads,
 } from 'chat-events';
 import { EventsStore } from './events.store';
 import { RealtimeGateway } from './realtime.gateway';
-import { emitStoredEvent, personRoom, WORKSPACE_ROOM } from './realtime-socket';
+import {
+  conversationRoom,
+  emitStoredEvent,
+  personRoom,
+  WORKSPACE_ROOM,
+} from './realtime-socket';
+
+// A Mensagem de um evento: a mesma para todos os Membros, ou montada para cada um.
+export type MessageForMembers =
+  MessagePayload | ((personId: string) => MessagePayload);
 
 // Emite os eventos guardados por Pessoa para as abas dela (spec da F03, "Eventos por Pessoa e
 // reconexão"). Quem chama publica depois da gravação. Cada evento entra antes no stream de cada
@@ -23,8 +33,13 @@ export class RealtimePublisher {
     private readonly events: EventsStore,
   ) {}
 
-  messageCreated(memberIds: string[], message: MessagePayload): Promise<void> {
-    return this.publish('message.created', memberIds, { message });
+  // A Mensagem nova, a mesma para todos, ou montada para cada Membro quando depende de quem lê
+  // (spec da F13, "Marca e Resposta bloqueada", item "WebSocket").
+  messageCreated(
+    memberIds: string[],
+    message: MessageForMembers,
+  ): Promise<void> {
+    return this.publishMessage('message.created', memberIds, message);
   }
 
   // A Mensagem apagada, pelo id, para os Membros (spec da F06, "Tempo real").
@@ -36,8 +51,11 @@ export class RealtimePublisher {
   }
 
   // A Mensagem editada, inteira, para os Membros (spec da F06, "Tempo real").
-  messageUpdated(memberIds: string[], message: MessagePayload): Promise<void> {
-    return this.publish('message.updated', memberIds, { message });
+  messageUpdated(
+    memberIds: string[],
+    message: MessageForMembers,
+  ): Promise<void> {
+    return this.publishMessage('message.updated', memberIds, message);
   }
 
   // Pessoas que entraram numa Conversa: vai para todos os Membros dela depois da gravação (spec da
@@ -76,6 +94,23 @@ export class RealtimePublisher {
     return this.publish('activity.unread', personIds, payloadFor);
   }
 
+  // A Tarefa criada ou que mudou de estado, para o Responsável e quem delegou (spec da F12,
+  // "Eventos").
+  // A carga é montada para cada Pessoa: a Notificação vai só a quem recebe.
+  taskCreated(
+    personIds: string[],
+    payloadFor: (personId: string) => StoredEventPayloads['task.created'],
+  ): Promise<void> {
+    return this.publish('task.created', personIds, payloadFor);
+  }
+
+  taskUpdated(
+    personIds: string[],
+    payloadFor: (personId: string) => StoredEventPayloads['task.updated'],
+  ): Promise<void> {
+    return this.publish('task.updated', personIds, payloadFor);
+  }
+
   // O Perfil que mudou, para todo o workspace, sem guardar: quem perde o evento numa queda vê o nome
   // novo ao recarregar (spec da F09, "Tempo real"). O nome também muda no "digitando".
   personUpdated(person: PersonUpdatedEvent): void {
@@ -86,6 +121,47 @@ export class RealtimePublisher {
     } catch (error) {
       this.logger.error('Falha ao publicar o Perfil', error);
     }
+  }
+
+  // O registro de Agentes mudou (spec da F10, "Evento agents.changed"): só diz "releia a lista", para
+  // todo o workspace, sem guardar nem reenviar; quem o perde relê na próxima conexão.
+  agentsChanged(): void {
+    try {
+      this.gateway.server.to(WORKSPACE_ROOM).emit('agents.changed');
+    } catch (error) {
+      this.logger.error('Falha ao publicar a mudança de Agentes', error);
+    }
+  }
+
+  // O "digitando" do bot, para as abas com a Conversa aberta, sem guardar nem reenviar, como o de
+  // Pessoa (spec da F11, ""Digitando" do bot"). O bot não tem aba, então ninguém fica de fora.
+  botTyping(
+    name: 'typing.start' | 'typing.stop',
+    conversationId: string,
+    author: MessageAuthorPayload,
+  ): void {
+    try {
+      this.to(conversationRoom(conversationId)).emit(name, {
+        conversation_id: conversationId,
+        author,
+      });
+    } catch (error) {
+      this.logger.error('Falha ao publicar o digitando do bot', error);
+    }
+  }
+
+  private publishMessage(
+    name: 'message.created' | 'message.updated',
+    memberIds: string[],
+    message: MessageForMembers,
+  ): Promise<void> {
+    return this.publish(
+      name,
+      memberIds,
+      typeof message === 'function'
+        ? (personId) => ({ message: message(personId) })
+        : { message },
+    );
   }
 
   private async publish<N extends StoredEventName>(

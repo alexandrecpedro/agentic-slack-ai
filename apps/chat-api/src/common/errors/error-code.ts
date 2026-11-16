@@ -10,10 +10,22 @@ export type ErrorCode =
   | 'members_not_editable'
   | 'message_not_found'
   | 'message_not_owned'
+  | 'forbidden'
   | 'quoted_message_not_found'
   | 'not_found'
   | 'payload_too_large'
   | 'request_rejected'
+  | 'bot_not_found'
+  | 'invalid_bot_token'
+  | 'request_not_found'
+  | 'request_closed'
+  | 'request_expired'
+  | 'report_not_started'
+  | 'data_access_required'
+  | 'assignee_not_member'
+  | 'assignee_is_bot'
+  | 'task_not_found'
+  | 'task_not_assignee'
   | 'internal_error';
 
 export const ERROR_STATUS: Record<ErrorCode, number> = {
@@ -28,9 +40,21 @@ export const ERROR_STATUS: Record<ErrorCode, number> = {
   members_not_editable: 409,
   message_not_found: 404,
   message_not_owned: 403,
+  forbidden: 403,
   quoted_message_not_found: 404,
   not_found: 404,
   payload_too_large: 413,
   request_rejected: 400,
+  bot_not_found: 422,
+  invalid_bot_token: 401,
+  request_not_found: 404,
+  request_closed: 409,
+  request_expired: 410,
+  report_not_started: 409,
+  data_access_required: 403,
+  assignee_not_member: 422,
+  assignee_is_bot: 422,
+  task_not_found: 404,
+  task_not_assignee: 403,
   internal_error: 500,
 };

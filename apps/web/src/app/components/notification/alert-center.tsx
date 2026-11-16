@@ -1,5 +1,6 @@
 "use client";
 
+import type { TaskNotificationPayload } from "chat-events";
 import { useRouter } from "next/navigation";
 import { useEffect, useEffectEvent } from "react";
 import { toast } from "sonner";
@@ -8,9 +9,11 @@ import { useRealtime } from "@/app/components/realtime/realtime-provider";
 import { useAnyTabFocused } from "@/app/hooks/use-any-tab-focused";
 import { useBrowserNotifications } from "@/app/hooks/use-browser-notifications";
 import { useTabFocus } from "@/app/hooks/use-tab-focus";
+import { displayText } from "@/app/utils/business-data";
 import { useNotificationItems } from "@/app/hooks/use-notification-items";
-import type { Message } from "@/app/services/chat-api";
-import { notificationTitle } from "@/app/utils/activity";
+import type { Message, Task } from "@/app/services/chat-api";
+import { markTaskNotificationOpened } from "@/app/services/task-notifications";
+import { notificationTitle, taskHref, taskItemFromEvent, taskNotificationTitle } from "@/app/utils/activity";
 import { notificationPreview } from "@/app/utils/browser-notifications";
 import { fetchConversationList } from "@/app/services/conversation-list";
 import { conversationsKey, messageHref } from "@/app/utils/conversation-list";
@@ -54,7 +57,7 @@ export function AlertCenter({ personId }: { personId: string }) {
       // mostra uma só. O clique traz esta aba para a frente na Mensagem.
       try {
         const notification = new Notification(notificationTitle(item), {
-          body: notificationPreview(message.body),
+          body: notificationPreview(displayText(message)),
           tag: message.id,
         });
         notification.onclick = () => {
@@ -70,7 +73,7 @@ export function AlertCenter({ personId }: { personId: string }) {
     }
     toast(notificationTitle(item), {
       id: message.id,
-      description: message.body,
+      description: displayText(message),
       duration: ALERT_DURATION_MS,
       action: {
         label: "Abrir",
@@ -79,11 +82,61 @@ export function AlertCenter({ personId }: { personId: string }) {
     });
   });
 
+  // A Notificação de Tarefa (spec da F12, "Cliente (web)"): o mesmo destino, com a aba Tarefas
+  // aberta e em foco no lugar da Conversa aberta. "Abrir" e o clique levam à Tarefa e a deixam lida.
+  const alertForTask = useEffectEvent(async (task: Task, notification: TaskNotificationPayload) => {
+    const item = taskItemFromEvent(task, notification);
+    const isBrowserEnabled = browser.state === "on";
+    const isTasksTabOpen =
+      window.location.pathname === "/atividade" && new URLSearchParams(window.location.search).get("aba") === "tarefas";
+    const destination = notificationDestination({
+      kind: notification.kind,
+      isTabFocused,
+      isConversationOpen: isTasksTabOpen,
+      isAnyTabFocused: isTabFocused || !isBrowserEnabled ? isTabFocused : await isAnyTabFocused(),
+      isBrowserEnabled,
+    });
+    // Chegando com a aba Tarefas aberta e em foco, ela já nasce lida, como a Mensagem na Conversa
+    // aberta (spec da F08, "Notificações e contagem").
+    if (isTabFocused && isTasksTabOpen) void markTaskNotificationOpened(notification.id);
+    if (destination === "none") return;
+    const title = taskNotificationTitle(notification.kind, item.actor.name);
+    const open = () => {
+      void markTaskNotificationOpened(notification.id);
+      router.push(taskHref(task.id));
+    };
+    if (destination === "browser") {
+      try {
+        const browserNotification = new Notification(title, {
+          body: notificationPreview(task.title),
+          tag: notification.id,
+        });
+        browserNotification.onclick = () => {
+          window.focus();
+          open();
+          browserNotification.close();
+        };
+      } catch {
+        // Como na Mensagem: sem o construtor, a Notificação fica em Atividade e no rail.
+      }
+      return;
+    }
+    toast(title, {
+      id: notification.id,
+      description: task.title,
+      duration: ALERT_DURATION_MS,
+      action: { label: "Abrir", onClick: open },
+    });
+  });
+
   useEffect(
     () =>
       subscribe({
         onMessage: (message, { isReplay }) => {
           if (!isReplay) void alertFor(message);
+        },
+        onTask: (task, { isReplay }, notification) => {
+          if (!isReplay && notification) void alertForTask(task, notification);
         },
       }),
     [subscribe],

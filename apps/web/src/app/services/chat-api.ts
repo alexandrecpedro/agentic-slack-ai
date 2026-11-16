@@ -1,6 +1,10 @@
 import type {
+  TaskNotificationKind,
+  TaskPayload,
+  TaskPersonPayload,
   ConversationPayload,
   MentionPayload,
+  MessageAuthorPayload,
   MessagePayload,
   QuotePayload,
   Presence,
@@ -17,9 +21,11 @@ import {
   unreadFromPayload,
   type UnreadPayload,
 } from "@/app/utils/conversation-event";
+import type { AgentErrorReason, AgentRequestFailure } from "@/app/utils/agent-request-failure";
 import { initials } from "@/app/utils/initials";
 import type { Theme } from "@/app/utils/theme";
 import { messageFromEvent } from "@/app/utils/message-event";
+import { taskFromPayload } from "@/app/utils/tasks";
 import { activityUnreadFromPayload, type ActivityUnreadPayload } from "@/app/utils/activity-unread";
 
 // Service HTTP da API do chat, usado só no servidor (Server Actions, Server Components e
@@ -40,19 +46,31 @@ type ApiPerson = {
   presence_choice: Presence;
   // O tema escolhido (spec da F09, "Pessoas").
   theme: Theme;
+  // O papel de administrador (spec da F10, "Papel de administrador").
+  is_admin: boolean;
+  // A Permissão de dados (spec da F13, "Permissão de dados"), enviada no Pedido.
+  data_access: boolean;
 };
 
 // As iniciais saem aqui, no servidor, e seguem prontas para os componentes do cliente
 // (utils/initials.ts).
-export type Person = Omit<ApiPerson, "time_zone" | "presence_choice"> & {
+export type Person = Omit<ApiPerson, "time_zone" | "presence_choice" | "is_admin" | "data_access"> & {
   initials: string;
   timeZone: string | null;
   // A escolha de presença (spec da F09, "Pessoas").
   presenceChoice: Presence;
+  isAdmin: boolean;
+  dataAccess: boolean;
 };
 
-function toPerson({ time_zone: timeZone, presence_choice: presenceChoice, ...person }: ApiPerson): Person {
-  return { ...withInitials(person), timeZone, presenceChoice };
+function toPerson({
+  time_zone: timeZone,
+  presence_choice: presenceChoice,
+  is_admin: isAdmin,
+  data_access: dataAccess,
+  ...person
+}: ApiPerson): Person {
+  return { ...withInitials(person), timeZone, presenceChoice, isAdmin, dataAccess };
 }
 
 export type LoginResult =
@@ -210,7 +228,9 @@ function withInitials<T extends { name: string }>(person: T): T & { initials: st
   return { ...person, initials: initials(person.name) };
 }
 
-export type MessageAuthor = PersonSummary;
+// Quem escreveu a Mensagem, Pessoa ou bot de um Agente, com as iniciais para o avatar da Pessoa
+// (spec da F11, "Autor da Mensagem").
+export type MessageAuthor = MessageAuthorPayload & { initials: string };
 
 export type Message = {
   id: string;
@@ -225,6 +245,26 @@ export type Message = {
   mentions: Mention[];
   // A Citação, com o autor e o texto atual da original, ou a marca de apagada (spec da F06).
   quote: Quote | null;
+  // As Respostas prontas da pergunta do Agente, ou nulas (spec da F11, "Envio e Pergunta pendente").
+  quickReplies: QuickReplies | null;
+  // A marca "dados de negócio" e a Resposta bloqueada, para quem lê sem Permissão de dados (spec da
+  // F13, "Marca e Resposta bloqueada").
+  businessData: boolean;
+  blocked: boolean;
+  // O PDF da entrega do Relatório, nulo na versão bloqueada e nas outras Mensagens (spec da F14,
+  // "Cliente (web)").
+  report: Report | null;
+};
+
+// O PDF da entrega do Relatório: o nome do arquivo e o tamanho em bytes.
+export type Report = { fileName: string; sizeBytes: number };
+
+// Os botões da pergunta do Agente: os rótulos, quem pode responder, até quando e se já se encerrou.
+export type QuickReplies = {
+  options: string[];
+  ownerId: string;
+  expiresAt: string;
+  closed: boolean;
 };
 
 export type Mention = MentionPayload;
@@ -257,8 +297,29 @@ export type CreateChannelResult =
   | { kind: "unauthenticated" }
   | { kind: "failure" };
 
+type ApiAgentRequest = {
+  id: string;
+  kind: AgentRequest["kind"];
+  bot_username: string;
+  parent_request_id: string | null;
+};
+
+// O Pedido que a Mensagem criou ao mencionar um Agente (spec da F11, "Envio e Pergunta pendente").
+export type AgentRequest = {
+  id: string;
+  kind: "new" | "continuation";
+  botUsername: string;
+  parentRequestId: string | null;
+};
+
+// O Agente não recebeu o Pedido da Mensagem gravada: o aviso ao lado dela, só para quem pediu (LLD,
+// "Erros").
+export type AgentError = { reason: AgentErrorReason; agentName: string };
+
 export type SendMessageResult =
-  | { kind: "ok"; message: Message }
+  | { kind: "ok"; message: Message; agentRequest: AgentRequest | null; agentError?: AgentError }
+  // O agent_username não é de um bot: o Agente está conectado, mas o bot dele não foi criado.
+  | { kind: "bot_not_found" }
   | { kind: "invalid" }
   | { kind: "not_found" }
   // A Mensagem citada não existe mais nesta Conversa (spec da F06, "Citação").
@@ -365,7 +426,7 @@ export async function listMessages(
 export async function sendMessage(
   token: string,
   conversationId: string,
-  message: { clientId: string; body: string; quotedMessageId?: string },
+  message: { clientId: string; body: string; quotedMessageId?: string; agentUsername?: string },
 ): Promise<SendMessageResult> {
   const response = await request(conversationPath(conversationId, "/messages"), {
     method: "POST",
@@ -374,18 +435,49 @@ export async function sendMessage(
       client_id: message.clientId,
       body: message.body,
       quoted_message_id: message.quotedMessageId,
+      agent_username: message.agentUsername,
     }),
   });
   if (response?.status === 201) {
-    const body = await jsonBody<{ message: ApiMessage }>(response);
-    if (body) return { kind: "ok", message: messageFromEvent(body.message) };
-    return { kind: "failure" };
+    const body = await jsonBody<{ message: ApiMessage; agent_request: ApiAgentRequest | null }>(response);
+    if (!body) return { kind: "failure" };
+    const pending = body.agent_request;
+    return {
+      kind: "ok",
+      message: messageFromEvent(body.message),
+      agentRequest: pending && {
+        id: pending.id,
+        kind: pending.kind,
+        botUsername: pending.bot_username,
+        parentRequestId: pending.parent_request_id,
+      },
+    };
   }
   if (response?.status === 400) return { kind: "invalid" };
+  if (response?.status === 422 && (await errorCode(response)) === "bot_not_found") {
+    return { kind: "bot_not_found" };
+  }
   if (response?.status === 404 && (await errorCode(response)) === "quoted_message_not_found") {
     return { kind: "quote_not_found" };
   }
   return commonFailure(response);
+}
+
+// Encerra o Pedido que o Serviço de agentes não aceitou (spec da F11, "Disparo pelo BFF"). A falha só
+// vai para o log: o Pedido vence sozinho, e a tela já mostra o que precisa.
+export async function closeAgentRequest(
+  token: string,
+  requestId: string,
+  status: AgentRequestFailure["close"],
+): Promise<void> {
+  const response = await request(`/v1/agent-requests/${encodeURIComponent(requestId)}/close`, {
+    method: "POST",
+    headers: { ...authenticated(token), "content-type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (response?.status !== 204) {
+    console.warn(`Pedido não encerrado na API do chat (status ${response?.status ?? "sem resposta"})`);
+  }
 }
 
 // Editar a própria Mensagem (spec da F06, "Rotas").
@@ -485,13 +577,20 @@ export type SearchPeopleResult =
 
 export async function searchPeople(
   token: string,
-  { q, notMemberOf, memberOf }: { q: string; notMemberOf?: string; memberOf?: string },
+  {
+    q,
+    notMemberOf,
+    memberOf,
+    admin = false,
+  }: { q: string; notMemberOf?: string; memberOf?: string; admin?: boolean },
 ): Promise<SearchPeopleResult> {
   // Sem a Conversa, a busca do "Nova conversa" (spec da F05, "Busca"); com member_of, a lista de
   // menções (spec da F06).
   const query = new URLSearchParams({ q });
   if (notMemberOf !== undefined) query.set("not_member_of", notMemberOf);
   if (memberOf !== undefined) query.set("member_of", memberOf);
+  // Só os administradores, para o diálogo "Agentes" (spec da F10, "BFF").
+  if (admin) query.set("admin", "true");
   const response = await request(`/v1/people?${query.toString()}`, {
     method: "GET",
     headers: authenticated(token),
@@ -514,12 +613,17 @@ export type Profile = {
   timeZone: string | null;
   status: Status | null;
   presence?: Presence;
+  // O selo de administrador no painel de perfil (spec da F10, "Selo de administrador").
+  isAdmin: boolean;
 };
 
-type ApiProfile = Omit<Profile, "initials" | "timeZone"> & { time_zone: string | null };
+type ApiProfile = Omit<Profile, "initials" | "timeZone" | "isAdmin"> & {
+  time_zone: string | null;
+  is_admin: boolean;
+};
 
-function toProfile({ time_zone: timeZone, ...person }: ApiProfile): Profile {
-  return { ...withInitials(person), timeZone };
+function toProfile({ time_zone: timeZone, is_admin: isAdmin, ...person }: ApiProfile): Profile {
+  return { ...withInitials(person), timeZone, isAdmin };
 }
 
 export type GetProfileResult =
@@ -725,8 +829,17 @@ export async function listMembers(token: string, conversationId: string): Promis
 export type ActivityFilter = "all" | "mentions" | "direct";
 export type NotificationKind = "mention" | "direct";
 
-// Um item de Atividade: a Notificação, com a Mensagem como no histórico e a Conversa dela.
-export type ActivityItem = { kind: NotificationKind; message: Message; conversation: Conversation };
+// Um item de Atividade: a Notificação, com a Mensagem como no histórico e a Conversa dela, ou a
+// Notificação de Tarefa, com a Tarefa e quem agiu (spec da F12, "Atividade").
+export type MessageActivityItem = { kind: NotificationKind; message: Message; conversation: Conversation };
+export type { TaskNotificationKind } from "chat-events";
+export type TaskActivityItem = {
+  kind: "task";
+  notification: { id: string; kind: TaskNotificationKind; read: boolean };
+  task: Task;
+  actor: TaskPerson;
+};
+export type ActivityItem = MessageActivityItem | TaskActivityItem;
 
 export type ActivityPage = { items: ActivityItem[]; hasMore: boolean };
 
@@ -736,6 +849,7 @@ export type ActivityUnread = {
   totalCount: number;
   mentionCount: number;
   directCount: number;
+  taskCount: number;
 };
 
 export type ActivityPageResult =
@@ -748,7 +862,14 @@ export type ActivityUnreadResult =
   | { kind: "unauthenticated" }
   | { kind: "failure" };
 
-type ApiActivityItem = { kind: NotificationKind; message: ApiMessage; conversation: ApiConversation };
+type ApiActivityItem =
+  | { kind: NotificationKind; message: ApiMessage; conversation: ApiConversation }
+  | {
+      kind: "task";
+      notification: { id: string; kind: TaskNotificationKind; read: boolean };
+      task: TaskPayload;
+      actor: TaskPerson;
+    };
 
 // Uma página de Atividade: as anteriores a `before`, ou as mais novas sem ele, em ordem cronológica.
 export async function listActivity(
@@ -765,11 +886,16 @@ export async function listActivity(
   return {
     kind: "ok",
     page: {
-      items: result.body.items.map((item) => ({
-        kind: item.kind,
-        message: messageFromEvent(item.message),
-        conversation: conversationFromPayload(item.conversation),
-      })),
+      items: result.body.items.map(
+        (item): ActivityItem =>
+          item.kind === "task"
+            ? { kind: "task", notification: item.notification, task: taskFromPayload(item.task), actor: item.actor }
+            : {
+                kind: item.kind,
+                message: messageFromEvent(item.message),
+                conversation: conversationFromPayload(item.conversation),
+              },
+      ),
       hasMore: result.body.has_more,
     },
   };
@@ -792,17 +918,135 @@ export type MarkActivityReadResult =
   | { kind: "unauthenticated" }
   | { kind: "failure" };
 
-// Marca tudo como lido até a Mensagem (spec da F08, "Rotas"): só avança.
-export async function markActivityRead(token: string, messageId: string): Promise<MarkActivityReadResult> {
+// A posição de "Marcar tudo como lido": a Mensagem ou a Notificação de Tarefa mais nova.
+export type ActivityPosition = { messageId: string } | { taskNotificationId: string };
+
+// Marca tudo como lido até a posição (spec da F08, "Rotas"; spec da F12, "Atividade"): só avança.
+export async function markActivityRead(token: string, position: ActivityPosition): Promise<MarkActivityReadResult> {
   const response = await request("/v1/activity/read", {
     method: "PUT",
     headers: { ...authenticated(token), "content-type": "application/json" },
-    body: JSON.stringify({ message_id: messageId }),
+    body: JSON.stringify(
+      "messageId" in position
+        ? { message_id: position.messageId }
+        : { task_notification_id: position.taskNotificationId },
+    ),
   });
   if (response?.status === 200) {
     const body = await jsonBody<ActivityUnreadPayload>(response);
     return body ? { kind: "ok", unread: activityUnreadFromPayload(body) } : { kind: "failure" };
   }
   if (response?.status === 400) return { kind: "invalid" };
+  return commonFailure(response);
+}
+
+// Avisa o workspace que o registro de Agentes mudou (spec da F10, "BFF", passo 4): a API do chat
+// publica o agents.changed. Devolve se a API confirmou.
+export async function announceAgentsChanged(token: string): Promise<boolean> {
+  const response = await request("/v1/agents/changed", {
+    method: "POST",
+    headers: authenticated(token),
+  });
+  return response?.status === 204;
+}
+
+// Tarefas (spec da F12, "Concluir, reabrir e listar").
+export type TaskRole = "assigned" | "delegated";
+export type TaskPerson = TaskPersonPayload;
+
+export type Task = {
+  id: string;
+  title: string;
+  status: "open" | "done";
+  createdAt: string;
+  completedAt: string | null;
+  assignee: TaskPerson;
+  delegator: TaskPerson;
+  conversation: { id: string; name: string | null; kind: ConversationKind };
+  triggerMessage: { id: string; deleted: boolean };
+};
+
+export type TaskPage = { tasks: Task[]; nextCursor: string | null };
+
+export type TaskPageResult = { kind: "ok"; page: TaskPage } | { kind: "unauthenticated" } | { kind: "failure" };
+
+export type TaskResult =
+  | { kind: "ok"; task: Task }
+  | { kind: "not_found" }
+  | { kind: "not_assignee" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// Uma página das Tarefas recebidas ou delegadas, a partir do cursor da anterior.
+export async function listTasks(
+  token: string,
+  { role, cursor }: { role: TaskRole; cursor?: string },
+): Promise<TaskPageResult> {
+  const params = new URLSearchParams({ role });
+  if (cursor) params.set("cursor", cursor);
+  const result = await getJson<{ tasks: TaskPayload[]; next_cursor: string | null }>(
+    token,
+    `/v1/tasks?${params.toString()}`,
+  );
+  if (result.kind !== "ok") return result.kind === "unauthenticated" ? result : { kind: "failure" };
+  return {
+    kind: "ok",
+    page: { tasks: result.body.tasks.map(taskFromPayload), nextCursor: result.body.next_cursor },
+  };
+}
+
+// Uma Tarefa, para o Responsável ou quem delegou.
+export async function getTask(token: string, taskId: string): Promise<TaskResult> {
+  const result = await getJson<{ task: TaskPayload }>(token, `/v1/tasks/${encodeURIComponent(taskId)}`);
+  return result.kind === "ok" ? { kind: "ok", task: taskFromPayload(result.body.task) } : result;
+}
+
+// Conclui ou reabre a Tarefa do Responsável; a repetição devolve a Tarefa como está.
+export async function changeTaskStatus(
+  token: string,
+  taskId: string,
+  action: "complete" | "reopen",
+): Promise<TaskResult> {
+  const response = await request(`/v1/tasks/${encodeURIComponent(taskId)}/${action}`, {
+    method: "POST",
+    headers: authenticated(token),
+  });
+  if (response?.status === 200) {
+    const body = await jsonBody<{ task: TaskPayload }>(response);
+    return body ? { kind: "ok", task: taskFromPayload(body.task) } : { kind: "failure" };
+  }
+  if (response?.status === 403) return { kind: "not_assignee" };
+  return commonFailure(response);
+}
+
+export type MarkTaskNotificationResult = { kind: "ok" } | { kind: "not_found" } | { kind: "unauthenticated" } | { kind: "failure" };
+
+// Abre uma Notificação de Tarefa: ela fica lida (spec da F12, "Atividade").
+export async function markTaskNotificationRead(token: string, notificationId: string): Promise<MarkTaskNotificationResult> {
+  const response = await request(`/v1/activity/task-notifications/${encodeURIComponent(notificationId)}/read`, {
+    method: "PUT",
+    headers: authenticated(token),
+  });
+  return response?.status === 204 ? { kind: "ok" } : commonFailure(response);
+}
+
+export type MessageReportUrlResult =
+  | { kind: "ok"; url: string }
+  | { kind: "forbidden" }
+  | { kind: "not_found" }
+  | { kind: "unauthenticated" }
+  | { kind: "failure" };
+
+// A URL assinada do PDF da entrega do Relatório, com a Permissão de dados conferida pela API no
+// momento do pedido (spec da F14, "Referência ao PDF e download").
+export async function getMessageReportUrl(token: string, messageId: string): Promise<MessageReportUrlResult> {
+  const response = await request(`/v1/messages/${encodeURIComponent(messageId)}/report`, {
+    headers: authenticated(token),
+  });
+  if (response?.status === 200) {
+    const body = await jsonBody<{ url?: unknown }>(response);
+    return typeof body?.url === "string" ? { kind: "ok", url: body.url } : { kind: "failure" };
+  }
+  if (response?.status === 403) return { kind: "forbidden" };
   return commonFailure(response);
 }
